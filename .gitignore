@@ -10,7 +10,6 @@ evaluation
 *.pyc
 *.pyo
 *.pyd
-*.py
 run
 env_benchmark.h5
 models.zip
