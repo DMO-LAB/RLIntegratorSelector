@@ -1,0 +1,14 @@
+
+.codegpt
+.DS_Store
+.vscode
+.ipynb_checkpoints
+__pycache__
+evaluation 
+*.egg-info
+*.egg
+*.pyc
+*.pyo
+*.pyd
+*.py
+run

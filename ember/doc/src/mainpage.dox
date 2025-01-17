@@ -1,0 +1,11 @@
+/*! \mainpage Ember Documentation
+
+\b Ember is a code for simulating unsteady, quasi-one-dimensional flames
+subjected to arbitrarily varying strain rates and curvature.
+
+Documentation for the C++ core of the Ember solver can be accessed via the
+"Classes" and "Files" links above.
+
+For instructions on how to compile, install, and use Ember, see the
+<a href="../../sphinx/html/index.html">User's Guide</a>.
+*/
