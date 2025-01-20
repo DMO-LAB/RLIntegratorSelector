@@ -14,6 +14,11 @@ from typing import Optional, Dict, List
 import numpy as np
 import h5py
 
+import resource
+def print_memory_usage():
+    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    print(f"Memory usage: {usage / 1024 / 1024:.2f} MB")
+
 @dataclass
 class IntegratorOption:
     """Class to represent integrator options"""
@@ -610,34 +615,29 @@ class VectorizedCombustionEnv(gym.Env):
         
         # Accuracy reward
         #temp_reward = np.exp(-scaling['error'] * T_error / thresholds['error'])
-        temp_reward = np.exp(-T_error/thresholds['error'])
+        temp_reward = -np.log10(np.maximum(T_error, 1e-10))
         # species_reward = np.mean([
         #     np.exp(-scaling['error'] * error / thresholds['error'])
         #     for error in species_errors.values()
         # ])
         species_reward = np.mean([
-            np.exp(-error/thresholds['error'])
+            -np.log10(np.maximum(error, 1e-10))
             for error in species_errors.values()
         ])
-        #grad_reward = np.exp(-scaling['error'] * grad_error / thresholds['error'])
-        grad_reward = np.exp(-grad_error/thresholds['error'])
+        grad_reward = -np.log10(np.maximum(grad_error, 1e-10))
         
         accuracy_reward = weights['accuracy'] * (temp_reward + species_reward + grad_reward) / 3
         
         # Efficiency reward
-        # time_reward = weights['efficiency'] * np.exp(-scaling['time'] * cpu_time / thresholds['time'])
-        time_reward = np.exp(-cpu_time/thresholds['time']) * weights['efficiency']
+        #time_reward = weights['efficiency'] * np.exp(-scaling['time'] * cpu_time / thresholds['time'])
+        time_reward = -np.log10(np.maximum(cpu_time, 1e-10)) * weights['efficiency']
         
-        # Stability reward
-        if self.history_index >= 2:
-            idx = (self.history_index - 1) % self.features_config['window_size']
-            stability = np.std(self.history['temperature'][point_idx, max(0, idx-5):idx+1])
-            # stability_reward = weight s['stability'] * np.exp(-stability)
-            stability_reward = np.exp(-stability/thresholds['stability']) * weights['stability']
-        else:
-            stability_reward = 0
+        reward = accuracy_reward * time_reward * scaling['factor']
         
-        return accuracy_reward + time_reward + stability_reward
+        # if self.current_step >= self.end_step:
+        #     reward = reward - T_error
+        
+        return accuracy_reward * time_reward * scaling['factor']
     
     def step(self, action: np.ndarray):
         """Take a step using different integrators for each point"""
@@ -663,6 +663,7 @@ class VectorizedCombustionEnv(gym.Env):
                 T_error, species_errors, grad_error = self._calculate_point_error(i)
                 errors[i] = T_error + np.mean(list(species_errors.values())) + grad_error
                 rewards[i] = self._compute_point_reward(i, cpu_time, T_error, species_errors, grad_error)
+                rewards[i] = rewards[i] - np.maximum(0, np.log10(errors[i]))
             
             # Update history
             self._update_history()
@@ -699,10 +700,12 @@ class VectorizedCombustionEnv(gym.Env):
             
             self.current_step += 1
             
+            
             if self.current_step >= self.end_step:
                 print(f"Episode Done {self.current_step} - resetting environment")
                 done = True
                 truncated = True
+                # rewards = rewards - errors
             else:
                 truncated = False
                 
@@ -723,14 +726,17 @@ class VectorizedCombustionEnv(gym.Env):
     def reset(self, seed=None):
         """Reset the environment"""
         super().reset(seed=seed)
-        
+        print_memory_usage()
+        import gc
+        gc.collect()
+        print_memory_usage()
         # Initialize solver
         self.solver = _ember.FlameSolver(
             _create_config(self.sim_settings)
         )
         self.solver.initialize()
         
-        self.solver.set_integrator_types(['cvode'] * 100)
+        self.solver.set_integrator_types(['cvode'] * self.sim_settings.n_points)
         self.solver.step()
         # Reset data storage
         if self.save_step_data:
@@ -799,6 +805,7 @@ class VectorizedCombustionEnv(gym.Env):
         
         plt.tight_layout()
         plt.savefig(save_path)
+        plt.close()
     
     def save_episode(self, filename: str = None):
         """Save episode data with detailed statistics"""

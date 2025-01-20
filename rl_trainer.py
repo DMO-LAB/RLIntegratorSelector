@@ -17,18 +17,18 @@ class Args:
     seed: int = 1
     torch_deterministic: bool = True
     cuda: bool = False
-    track: bool = False
+    track: bool = True
     wandb_project_name: str = "combustion_control_1d"
     wandb_entity: str = None
     
     # Environment Parameters
     output_dir: str = 'run/rl_train'
-    t_end: float = 0.08
-    n_points: int = 100
+    t_end: float = 0.06
+    n_points: int = 50
     global_timestep: float = 1e-5
     
     # Algorithm specific arguments
-    total_timesteps: int = 100000
+    total_timesteps: int = 1000000
     learning_rate: float = 2.5e-3
     num_envs: int = 1
     num_steps: int = 80
@@ -177,6 +177,7 @@ def train(args):
                 action_distribution = np.bincount(actions) / len(actions)
                 
                 print(f"[STEP {global_step}] Action Distribution: {action_distribution}")
+            
             # Execute in environment
             next_obs, rewards, terminated, truncated, info = env.step(actions)
             
@@ -195,6 +196,7 @@ def train(args):
             
             # Check if episode is done
             if (terminated or truncated):
+
                 print(f"Episode Done {update} - resetting environment")
                 if env.save_step_data:
                     env.save_episode(f"{args.output_dir}/episode_{update}.h5")
@@ -212,7 +214,7 @@ def train(args):
             }, step=global_step)
         
         # Save model periodically
-        if update % 10 == 0:
+        if update % 100 == 0:
             save_path = f"models/{run_name}/checkpoint_{update}.pt"
             os.makedirs(os.path.dirname(save_path), exist_ok=True)
             ppo_agent.save(save_path)
@@ -298,6 +300,13 @@ def evaluate_policy(env, ppo_agent, num_episodes=4, step=0, run_name=None):
     plot_actions(episode_actions, step, dir=dir)
     
     env.render(save_path=f"{dir}/render_{step}.png")
+    if args.track:
+        wandb.log({
+            "charts/mean_reward_per_point": results['mean_reward_per_point'],
+            "charts/mean_error_per_point": results['mean_error_per_point']
+        }, step=step)
+        
+        wandb.save(f"{dir}/render_{step}.png")
     
     return results
 
@@ -331,10 +340,12 @@ def plot_evaluation_results(results, step, dir):
     plt.tight_layout()
     plt.savefig(f'{dir}/point_distributions_{step}.png')
     plt.close()
+    if args.track:
+        wandb.save(f"{dir}/point_distributions_{step}.png")
     
 def plot_actions(actions, step, dir):
     """Plot actions"""
-    times_to_plot = [10, 100, 1000, 2000, 3000, 5000, 6000, 7500]
+    times_to_plot = [10, 100, 1000, 2000, 3000, 4000, 5000, 5900]
     fig, axs = plt.subplots(len(times_to_plot)//2, 2, figsize=(12, 8))
     for i, time in enumerate(times_to_plot):
         axs[i//2, i%2].plot(actions[time])
@@ -342,9 +353,11 @@ def plot_actions(actions, step, dir):
     plt.tight_layout()
     plt.savefig(f'{dir}/actions_{step}.png')
     plt.close()
+    if args.track:
+        wandb.save(f"{dir}/actions_{step}.png")
 
 if __name__ == "__main__":
-    args = Args(cuda=False, model_path="models/combustion_ppo_1d__1__1736988505/checkpoint_850.pt")
+    args = Args(cuda=False)
 
     # Set default configurations if not provided
     if args.features_config is None:
@@ -359,19 +372,20 @@ if __name__ == "__main__":
     if args.reward_config is None:
         args.reward_config = {
             'weights': {
-                'accuracy': 0.6,
-                'efficiency': 0.3,
+                'accuracy': 1,
+                'efficiency': 1,
                 'stability': 0.0
             },
             'thresholds': {
-                'time': 0.05,
+                'time': 0.001,
                 'error': 100,
                 'stability': 0.1
             },
             'scaling': {
-                'time': 0.1,
+                'time': 0.01,
                 'error': 1.0,
-                'stability': 0.0
+                'stability': 0.0,
+                'factor': 0.1
             }
             }
     train(args)
