@@ -1,3 +1,4 @@
+
 #include "flameSolver.h"
 #include "scalarFunction.h"
 
@@ -20,10 +21,35 @@ FlameSolver::FlameSolver()
     #endif
 }
 
-FlameSolver::~FlameSolver()
-{
+FlameSolver::~FlameSolver() {
+    // Clean up pointers
     delete strainfunc;
     delete rateMultiplierFunction;
+    
+    // // sourceTerms will be cleaned up by boost::ptr_vector's destructor
+    // sourceTerms.clear();
+    
+    // // Clear any other resources
+    // gases.clear();
+    
+    // // Clear callbacks
+    // if (stateWriter) {
+    //     delete stateWriter;
+    //     stateWriter = nullptr;
+    // }
+    // if (timeseriesWriter) {
+    //     delete timeseriesWriter;
+    //     timeseriesWriter = nullptr;
+    // }
+    // if (heatLossFunction) {
+    //     delete heatLossFunction;
+    //     heatLossFunction = nullptr;
+    // }
+    
+    // // Clear interpolators
+    // vzInterp.reset();
+    // vrInterp.reset();
+    // TInterp.reset();
 }
 
 void FlameSolver::setOptions(const ConfigOptions& _options)
@@ -453,24 +479,15 @@ SourceSystem* FlameSolver::createSourceSystem(const std::string& type, size_t j)
         system = new SourceSystemCVODE();
     } else if (type == "qss") {
         system = new SourceSystemQSS();
-    } else if (type == "rk23") {
-        system = new SourceSystemRK23();
-    // } else if (type == "seulex") {
-    //     system = new SourceSystemSEULEX();
     } else if (type == "boostRK") {
         system = new SourceSystemBoostRK();
     } else {
         throw DebugException("Invalid integrator type: " + type);
     }
-    if (type == "rk23") {
-        system->setOptions(options);
-    }
     // Initialize the system
     system->setGas(&gas);
     system->initialize(nSpec);
-    if (type != "rk23") {
-        system->setOptions(options);
-    }
+    system->setOptions(options);
     system->setTimers(&reactionRatesTimer, &thermoTimer, &jacobianTimer);
     system->setRateMultiplierFunction(rateMultiplierFunction);
     system->setHeatLossFunction(heatLossFunction);
@@ -483,6 +500,35 @@ SourceSystem* FlameSolver::createSourceSystem(const std::string& type, size_t j)
     return system;
 }
 
+// void FlameSolver::setIntegratorType(size_t j, const std::string& type) {
+//     if (j >= nPoints) {
+//         throw DebugException("Point index out of bounds");
+//     }
+
+//     // Only update if the type is actually changing
+//     if (pointIntegratorTypes[j] != type) {
+//         // Store old state
+//         double old_T = sourceTerms[j].T;
+//         vector<double> old_Y(sourceTerms[j].Y.data(), sourceTerms[j].Y.data() + nSpec);
+//         double old_U = sourceTerms[j].U;
+
+//         // Create new system
+//         SourceSystem* new_system = createSourceSystem(type, j);
+        
+//         // Transfer state
+//         new_system->T = old_T;
+//         new_system->U = old_U;
+//         for (size_t k = 0; k < nSpec; k++) {
+//             new_system->Y[k] = old_Y[k];
+//         }
+
+//         // Replace old system
+//         sourceTerms.replace(j, new_system);
+//         pointIntegratorTypes[j] = type;
+//         useCVODE[j] = (type == "cvode");
+//     }
+// }
+
 void FlameSolver::setIntegratorType(size_t j, const std::string& type) {
     if (j >= nPoints) {
         throw DebugException("Point index out of bounds");
@@ -490,14 +536,18 @@ void FlameSolver::setIntegratorType(size_t j, const std::string& type) {
 
     // Only update if the type is actually changing
     if (pointIntegratorTypes[j] != type) {
+        // Create new system first, so we handle potential allocation failures 
+        SourceSystem* new_system = createSourceSystem(type, j);
+        if (!new_system) {
+            throw DebugException("Failed to create new source system");
+        }
+
         // Store old state
         double old_T = sourceTerms[j].T;
-        vector<double> old_Y(sourceTerms[j].Y.data(), sourceTerms[j].Y.data() + nSpec);
+        std::vector<double> old_Y(sourceTerms[j].Y.data(), 
+                               sourceTerms[j].Y.data() + nSpec);
         double old_U = sourceTerms[j].U;
 
-        // Create new system
-        SourceSystem* new_system = createSourceSystem(type, j);
-        
         // Transfer state
         new_system->T = old_T;
         new_system->U = old_U;
@@ -505,8 +555,9 @@ void FlameSolver::setIntegratorType(size_t j, const std::string& type) {
             new_system->Y[k] = old_Y[k];
         }
 
-        // Replace old system
+        // Replace old system using ptr_vector's replace method which handles deletion
         sourceTerms.replace(j, new_system);
+        
         pointIntegratorTypes[j] = type;
         useCVODE[j] = (type == "cvode");
     }
@@ -602,7 +653,7 @@ void FlameSolver::resizeAuxiliary()
             } else if (pointIntegratorTypes[j] == "qss") {
                 system = new SourceSystemQSS();
             } else { // rk23
-                system = new SourceSystemARK();
+                system = new SourceSystemBoostRK();
             }
 
             // Initialize the new system as before

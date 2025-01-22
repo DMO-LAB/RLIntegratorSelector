@@ -35,7 +35,23 @@ SundialsCvode::SundialsCvode(unsigned int n)
 
 SundialsCvode::~SundialsCvode()
 {
-    CVodeFree(&sundialsMem);
+    // 1) Free the CVODE solver memory
+    if (sundialsMem) {
+        CVodeFree(&sundialsMem); // sets sundialsMem to NULL internally
+        sundialsMem = nullptr;
+    }
+
+    // 2) Free the linear solver object if allocated
+    if (sundialsLinsol) {
+        SUNLinSolFree((SUNLinearSolver) sundialsLinsol);
+        sundialsLinsol = nullptr;
+    }
+
+    // 3) Free the matrix object if allocated
+    if (sundialsLinsolMatrix) {
+        SUNMatDestroy((SUNMatrix) sundialsLinsolMatrix);
+        sundialsLinsolMatrix = nullptr;
+    }
 }
 
 void SundialsCvode::initialize()

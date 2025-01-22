@@ -9,7 +9,7 @@ import wandb
 from torch.utils.tensorboard import SummaryWriter
 import matplotlib.pyplot as plt
 from environment import SimulationSettings, create_env
-from ppo import PPO, RolloutBuffer
+from ppo_single import PPO, RolloutBuffer
 
 @dataclass
 class Args:
@@ -29,12 +29,12 @@ class Args:
     
     # Algorithm specific arguments
     total_timesteps: int = 1000000
-    learning_rate: float = 2.5e-3
+    learning_rate: float = 2.5e-4
     num_envs: int = 1
-    num_steps: int = 80
+    num_steps: int = 200
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    num_minibatches: int = 16
+    num_minibatches: int = 64
     update_epochs: int = 10
     eps_clip: float = 0.2
     entropy_coef: float = 0.01
@@ -172,15 +172,16 @@ def train(args):
                 actions.append(action)
             actions = np.array(actions)
             
-            # get the action distribution
-            if global_step % 500 == 0:
-                action_distribution = np.bincount(actions) / len(actions)
-                
-                print(f"[STEP {global_step}] Action Distribution: {action_distribution}")
+            
             
             # Execute in environment
             next_obs, rewards, terminated, truncated, info = env.step(actions)
             
+            # get the action distribution
+            if global_step % 200 == 0:
+                action_distribution = np.bincount(actions) / len(actions)
+                
+                print(f"[STEP {global_step}] Action Distribution: {action_distribution} - reward: {np.sum(rewards)} - cpu time: {info['cpu_time']}")
             # Store step data
             for point_idx in range(args.n_points):
                 # Convert to done flag
@@ -203,6 +204,7 @@ def train(args):
                 next_obs, _ = env.reset()
 
         # Update PPO agent
+        print(f"Updating PPO agent {update}")
         ppo_agent.update()
         
         # Log training metrics
@@ -265,12 +267,14 @@ def evaluate_policy(env, ppo_agent, num_episodes=4, step=0, run_name=None):
             actions = np.array(actions)
             episode_actions.append(actions)
             
-            if global_step % 100 == 0:
-                print(f"[EvalSTEP {global_step}] Action Distribution: {np.bincount(actions) / len(actions)}")
+            
             
             obs, rewards, terminated, truncated, info = env.step(actions)
             done = terminated or truncated
             
+            
+            if global_step % 100 == 0:
+                print(f"[EvalSTEP {global_step}] Action Distribution: {np.bincount(actions) / len(actions)} - reward: {np.sum(rewards)}- cpu time: {info['cpu_time']}")
             episode_rewards[episode] += rewards
             episode_length += 1
             global_step += 1
@@ -355,6 +359,9 @@ def plot_actions(actions, step, dir):
     plt.close()
     if args.track:
         wandb.save(f"{dir}/actions_{step}.png")
+        
+        
+
 
 if __name__ == "__main__":
     args = Args(cuda=False)
@@ -363,29 +370,26 @@ if __name__ == "__main__":
     if args.features_config is None:
         args.features_config = {
             'local_features': True,
-            'neighbor_features': False,
+            'neighbor_features': True,
             'gradient_features': False,
-            'temporal_features': True,
+            'temporal_features': False,
             'window_size': 4
         }
 
     if args.reward_config is None:
         args.reward_config = {
             'weights': {
-                'accuracy': 1,
-                'efficiency': 1,
-                'stability': 0.0
-            },
-            'thresholds': {
-                'time': 0.001,
-                'error': 100,
+                'accuracy': 0.6,
+                'efficiency': 0.3,
                 'stability': 0.1
             },
+            'thresholds': {
+                'time': 0.005,
+                'error': 1
+            },
             'scaling': {
-                'time': 0.01,
-                'error': 1.0,
-                'stability': 0.0,
-                'factor': 0.1
+                'time': 5,
+                'error': 10
             }
             }
     train(args)

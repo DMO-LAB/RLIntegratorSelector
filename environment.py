@@ -14,10 +14,12 @@ from typing import Optional, Dict, List
 import numpy as np
 import h5py
 
-import resource
-def print_memory_usage():
-    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    print(f"Memory usage: {usage / 1024 / 1024:.2f} MB")
+def get_memory_usage():
+    """Get current memory usage in MB"""
+    import psutil
+    import os
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / 1024 / 1024
 
 @dataclass
 class IntegratorOption:
@@ -606,31 +608,6 @@ class VectorizedCombustionEnv(gym.Env):
         
         return T_error, species_errors, grad_error
     
-    # def _compute_point_reward(self, point_idx: int, cpu_time: float, 
-    #                         T_error: float, species_errors: dict, grad_error: float) -> float:
-    #     """Compute reward for a specific point"""
-    #     weights = self.reward_config['weights']
-    #     thresholds = self.reward_config['thresholds']
-    #     scaling = self.reward_config['scaling']
-        
-    #     # Accuracy reward
-    #     temp_reward = np.exp(-scaling['error'] * (T_error / thresholds['error']))
-        
-    #     species_reward = np.mean([
-    #         np.exp(-scaling['error'] * (error / thresholds['error']))
-    #         for error in species_errors.values()
-    #     ])
-    #     grad_reward = np.exp(-scaling['error'] * (grad_error / thresholds['error']))
-        
-    #     accuracy_reward = weights['accuracy'] * (temp_reward + species_reward + grad_reward) / 3
-        
-    #     # Efficiency reward
-    #     time_reward = weights['efficiency'] * np.exp(-scaling['time'] * (cpu_time / thresholds['time']))
-        
-    #     reward = accuracy_reward + time_reward
-        
-    #     return reward
-    
     def _compute_point_reward(self, point_idx: int, cpu_time: float, 
                             T_error: float, species_errors: dict, grad_error: float) -> float:
         """
@@ -685,6 +662,7 @@ class VectorizedCombustionEnv(gym.Env):
             start_time = time.time()
             self.solver.set_integrator_types(integrator_types)
             done = self.solver.step()
+            
             cpu_time = time.time() - start_time
             
             # Calculate errors and rewards for each point
@@ -738,6 +716,11 @@ class VectorizedCombustionEnv(gym.Env):
                 print(f"Episode Done {self.current_step} - resetting environment")
                 done = True
                 truncated = True
+                
+                # delete the output directory
+                import shutil
+                shutil.rmtree(self.sim_settings.output_dir)
+
                 # rewards = rewards - errors
             else:
                 truncated = False
@@ -759,11 +742,7 @@ class VectorizedCombustionEnv(gym.Env):
     def reset(self, seed=None, options=None):
         """Reset the environment"""
         super().reset(seed=seed)
-        print_memory_usage()
-        import gc
-        gc.collect()
-        print_memory_usage()
-        # Initialize solver
+        # # Initialize solver
         self.solver = _ember.FlameSolver(
             _create_config(self.sim_settings)
         )
@@ -957,9 +936,6 @@ def create_env(sim_settings: SimulationSettings,
     )
     
     return env
-
-
-
 
 
 if __name__ == "__main__":

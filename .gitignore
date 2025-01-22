@@ -14,3 +14,7 @@ run
 env_benchmark.h5
 models.zip
 ember/python/ember/examples/cpp_history.npz.npy
+PPO_output/
+experiments/
+test_output/
+wandb/
