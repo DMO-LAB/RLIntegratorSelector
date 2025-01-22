@@ -293,7 +293,7 @@ def train(env, ppo_config: PPOConfig, trainer_config: TrainerConfig, args: Args)
     agent = PPOAgent(
         obs_dim=env.observation_space.shape[1],
         n_actions=2,
-        hidden_dims=[64, 64],
+        hidden_dims=[128, 128],
         config=ppo_config,
         device=device
     )
@@ -330,7 +330,30 @@ if __name__ == "__main__":
         batch_size=32,
         buffer_size=30000
     )
+    
+    reward_config = {
+            'weights': {
+                'accuracy': 1,
+                'efficiency': 3,
+            },
+            'thresholds': {
+                'time': 0.001,
+                'error': 1
+            },
+            'scaling': {
+                'time': 1,
+                'error': 1
+            }
+        }
 
+    features_config = {
+            'local_features': True,
+            'neighbor_features': True,
+            'gradient_features': False,
+            'temporal_features': False,
+            'window_size': 4
+        }
+    
     trainer_config = TrainerConfig(
         exp_name=args.exp_name,
         cuda=True,
@@ -355,7 +378,7 @@ if __name__ == "__main__":
         benchmark_file='env_benchmark.h5',
         species_to_track=['CH4', 'O2', 'CO2', 'H2O'],
         features_config=None,
-        reward_config=None,
+        reward_config=reward_config,
         save_step_data=False
     )
 
