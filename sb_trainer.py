@@ -18,7 +18,7 @@ class TrainerConfig:
     exp_name: str = "combustion_ppo_1d"
     seed: int = 1
     cuda: bool = True
-    track: bool = False
+    track: bool = True
     wandb_project_name: str = "combustion_control_1d"
     wandb_entity: Optional[str] = None
     
@@ -126,11 +126,8 @@ class EfficientTrainer:
         done = False
         while not done:
             # Select action
-            #action, log_prob, value = self.agent.select_action(state)
-            action = self.env.action_space.sample()
-            log_prob = np.zeros(self.env.sim_settings.n_points)
-            value = np.zeros(self.env.sim_settings.n_points)
-            
+            action, log_prob, value = self.agent.select_action(state)
+
             # Step environment
             next_state, reward, done, truncated, info = self.env.step(action)
             
@@ -166,10 +163,10 @@ class EfficientTrainer:
             
             if done or truncated:
                 # Final batch processing
-                # if transitions_batch:
-                #     metrics = self._process_batch(transitions_batch)
-                #     for k, v in metrics.items():
-                #         episode_metrics[k] += v
+                if transitions_batch:
+                    metrics = self._process_batch(transitions_batch)
+                    for k, v in metrics.items():
+                        episode_metrics[k] += v
                 
                 # Evaluation and saving
                 if episode % self.config.eval_freq == 0:
@@ -197,8 +194,6 @@ class EfficientTrainer:
     
     def _process_batch(self, transitions: List[Dict]) -> Dict:
         """Process a batch of transitions efficiently"""
-        print(f"Processing batch - Memory before: {get_memory_usage():.2f} MB")
-        
         # Store transitions
         for t in transitions:
             self.agent.store_transition(
@@ -207,7 +202,7 @@ class EfficientTrainer:
             )
         
         # Update policy
-        #metrics = self.agent.update()
+        metrics = self.agent.update()
         metrics = {}
         print(f"Batch processed - Memory after: {get_memory_usage():.2f} MB")
         return metrics
@@ -309,102 +304,6 @@ def train(env, ppo_config: PPOConfig, trainer_config: TrainerConfig, args: Args)
     
     return trained_agent
 
-def evaluate_policy(
-    env,
-    agent,
-    n_episodes: int = 1,
-    render: bool = False,
-    render_path: str = "renders"
-):
-    """Evaluate a trained policy"""
-    episode_rewards = []
-    episode_errors = []
-    episode_times = []
-    
-    for episode in range(n_episodes):
-        state, _ = env.reset()
-        episode_reward = 0
-        total_errors = np.zeros(env.sim_settings.n_points)
-        total_time = 0
-        episode_actions = []
-        
-        step = 0
-        while True:
-            # Select action
-            with torch.no_grad():
-                actions, _, _ = agent.select_action(state, deterministic=True)
-            
-            episode_actions.append(actions)
-            # Step environment
-            next_state, rewards, done, truncated, info = env.step(actions)
-            
-            # Track metrics
-            episode_reward += rewards
-            total_errors += info['point_errors']
-            total_time += info['cpu_time']
-
-            if step % 500 == 0:
-                cvode_actions, rk4_actions = get_action_distribution(actions)
-                print(f"[EVALUATION]: Episode {episode} - Step {step} - Reward: {np.sum(rewards):.2f}, Time: {total_time:.4f}, Action Distribution: cvode: {cvode_actions}, rk4: {rk4_actions}")
-                print(f"Memory usage: {get_memory_usage()}")
-            
-            if done or truncated:
-                break
-                
-            state = next_state
-            step += 1
-        
-        episode_rewards.append(episode_reward)
-        episode_errors.append(total_errors)
-        episode_times.append(total_time)
-    
-    episode_rewards = np.array(episode_rewards)
-    episode_errors = np.array(episode_errors)
-    episode_times = np.array(episode_times)
-    
-    results = {
-        "mean_reward_per_point": np.mean(episode_rewards, axis=0),      
-        "std_reward_per_point": np.std(episode_rewards, axis=0),
-        "mean_error_per_point": np.mean(episode_errors, axis=0),
-        "std_error_per_point": np.std(episode_errors, axis=0),
-        "mean_time_per_point": np.mean(episode_times, axis=0),
-        "std_time_per_point": np.std(episode_times, axis=0)
-    }
-
-    
-    return results, episode_actions
-
-def plot_evaluation_results(results, step, dir):
-    """Plot evaluation results"""
-    plt.figure(figsize=(10, 8))
-    
-    # Reward distribution
-    plt.subplot(2, 1, 1)
-    plt.plot(results['mean_reward_per_point'], label='Mean Reward')
-    plt.fill_between(
-        range(len(results['mean_reward_per_point'])),
-        results['mean_reward_per_point'] - results['std_reward_per_point'],
-        results['mean_reward_per_point'] + results['std_reward_per_point'],
-        alpha=0.3
-    )
-    plt.title('Reward Distribution Across Grid Points')
-    plt.xlabel('Grid Point')
-    plt.ylabel('Reward')
-    plt.legend()
-    
-    # Error distribution
-    plt.subplot(2, 1, 2)
-    plt.plot(results['mean_error_per_point'], 'r-', label='Mean Error')
-    plt.yscale('log')
-    plt.title('Error Distribution Across Grid Points')
-    plt.xlabel('Grid Point')
-    plt.ylabel('Error')
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.savefig(f'{dir}/point_distributions_{step}.png')
-    plt.close()
-
 def plot_actions(actions, step, dir):
     """Plot actions"""
     times_to_plot = [10, 100, 1000, 2000, 3000, 4000, 5000, 5900]
@@ -417,7 +316,6 @@ def plot_actions(actions, step, dir):
     plt.close()
         
         
-
 if __name__ == "__main__":
     # Create configurations
     args = Args()
@@ -428,15 +326,15 @@ if __name__ == "__main__":
         gae_lambda=0.95,
         clip_ratio=0.2,
         target_kl=0.01,
-        n_epochs=3,
+        n_epochs=10,
         batch_size=32,
-        buffer_size=300
+        buffer_size=30000
     )
 
     trainer_config = TrainerConfig(
         exp_name=args.exp_name,
         cuda=True,
-        track=False,
+        track=True,
         total_timesteps=1000000,
         batch_size=300
     )
