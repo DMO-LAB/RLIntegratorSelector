@@ -140,7 +140,7 @@ class SimulationData:
     
     def get_step(self, step: int) -> SimulationStep:
         """Get data for a specific step"""
-        if step >= self.current_step:
+        if step > self.current_step:
             raise IndexError(f"Step {step} not available. Current step is {self.current_step}")
         
         return SimulationStep(
@@ -606,38 +606,70 @@ class VectorizedCombustionEnv(gym.Env):
         
         return T_error, species_errors, grad_error
     
+    # def _compute_point_reward(self, point_idx: int, cpu_time: float, 
+    #                         T_error: float, species_errors: dict, grad_error: float) -> float:
+    #     """Compute reward for a specific point"""
+    #     weights = self.reward_config['weights']
+    #     thresholds = self.reward_config['thresholds']
+    #     scaling = self.reward_config['scaling']
+        
+    #     # Accuracy reward
+    #     temp_reward = np.exp(-scaling['error'] * (T_error / thresholds['error']))
+        
+    #     species_reward = np.mean([
+    #         np.exp(-scaling['error'] * (error / thresholds['error']))
+    #         for error in species_errors.values()
+    #     ])
+    #     grad_reward = np.exp(-scaling['error'] * (grad_error / thresholds['error']))
+        
+    #     accuracy_reward = weights['accuracy'] * (temp_reward + species_reward + grad_reward) / 3
+        
+    #     # Efficiency reward
+    #     time_reward = weights['efficiency'] * np.exp(-scaling['time'] * (cpu_time / thresholds['time']))
+        
+    #     reward = accuracy_reward + time_reward
+        
+    #     return reward
+    
     def _compute_point_reward(self, point_idx: int, cpu_time: float, 
                             T_error: float, species_errors: dict, grad_error: float) -> float:
-        """Compute reward for a specific point"""
+        """
+        Compute reward for a specific point with better scaling and stability
+        
+        Returns:
+            float: Reward value between -1 and 1
+        """
         weights = self.reward_config['weights']
         thresholds = self.reward_config['thresholds']
         scaling = self.reward_config['scaling']
         
-        # Accuracy reward
-        #temp_reward = np.exp(-scaling['error'] * T_error / thresholds['error'])
-        temp_reward = -np.log10(np.maximum(T_error, 1e-10))
-        # species_reward = np.mean([
-        #     np.exp(-scaling['error'] * error / thresholds['error'])
-        #     for error in species_errors.values()
-        # ])
-        species_reward = np.mean([
-            -np.log10(np.maximum(error, 1e-10))
-            for error in species_errors.values()
-        ])
-        grad_reward = -np.log10(np.maximum(grad_error, 1e-10))
+        # Compute normalized errors (between 0 and 1)
+        norm_T_error = np.minimum(1.0, T_error / thresholds['error'])
+        norm_species_errors = np.minimum(1.0, 
+            np.mean([error / thresholds['error'] for error in species_errors.values()]))
+        norm_grad_error = np.minimum(1.0, grad_error / thresholds['error'])
         
-        accuracy_reward = weights['accuracy'] * (temp_reward + species_reward + grad_reward) / 3
+        # Combined error metric (0 = no error, 1 = max error)
+        total_error = (norm_T_error + norm_species_errors + norm_grad_error) / 3
         
-        # Efficiency reward
-        #time_reward = weights['efficiency'] * np.exp(-scaling['time'] * cpu_time / thresholds['time'])
-        time_reward = -np.log10(np.maximum(cpu_time, 1e-10)) * weights['efficiency']
+        # Accuracy reward component (-1 to 1)
+        accuracy_reward = weights['accuracy'] * (2 * np.exp(-scaling['error'] * total_error) - 1)
         
-        reward = accuracy_reward * time_reward * scaling['factor']
+        # Normalize CPU time (0 to 1)
+        norm_time = np.minimum(1.0, cpu_time / thresholds['time'])
         
-        # if self.current_step >= self.end_step:
-        #     reward = reward - T_error
+        # Efficiency reward component (-1 to 1) 
+        efficiency_reward = weights['efficiency'] * (2 * np.exp(-scaling['time'] * norm_time) - 1)
         
-        return accuracy_reward * time_reward * scaling['factor']
+        # Combine rewards
+        reward = accuracy_reward + efficiency_reward
+        
+        # Add stability penalty for very large errors
+        if total_error > 0.8:  # Only penalize severe errors
+            stability_penalty = -weights['stability'] * (total_error - 0.8) * 5
+            reward += stability_penalty
+        
+        return reward
     
     def step(self, action: np.ndarray):
         """Take a step using different integrators for each point"""
@@ -663,8 +695,9 @@ class VectorizedCombustionEnv(gym.Env):
                 T_error, species_errors, grad_error = self._calculate_point_error(i)
                 errors[i] = T_error + np.mean(list(species_errors.values())) + grad_error
                 rewards[i] = self._compute_point_reward(i, cpu_time, T_error, species_errors, grad_error)
-                rewards[i] = rewards[i] - np.maximum(0, np.log10(errors[i]))
-            
+                #rewards[i] = rewards[i] - np.maximum(0, np.log10(np.maximum(errors[i], 1e-10))/2)
+            #     print(f"Reward {i}: {rewards[i]} - action: {action[i]} - error: {errors[i]} - cpu_time: {cpu_time}")
+            # print(f"Sum of rewards at step {self.current_step}: {np.sum(rewards)}")
             # Update history
             self._update_history()
             
@@ -723,7 +756,7 @@ class VectorizedCombustionEnv(gym.Env):
                 {'error': float('inf'), 'cpu_time': 0.0}
             )
     
-    def reset(self, seed=None):
+    def reset(self, seed=None, options=None):
         """Reset the environment"""
         super().reset(seed=seed)
         print_memory_usage()
@@ -949,10 +982,10 @@ if __name__ == "__main__":
         species_to_track=['CH4', 'O2', 'CO2', 'H2O'],
         features_config={
             'local_features': True,
-            'neighbor_features': False,
-            'gradient_features': False,
-            'temporal_features': False,
-            'window_size': 5
+            'neighbor_features': True,
+            'gradient_features': True,
+            'temporal_features': True,
+            'window_size': 5  
         },
         reward_config={
             'weights': {
