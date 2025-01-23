@@ -818,6 +818,10 @@ cdef class FlameSolver:
         def __get__(self):
             return getArray_Vec(self.solver.jCorr)
 
+    property gridPointIntegrationTimes:
+        def __get__(self):
+            return getArray_Vec(self.solver.gridPointIntegrationTimes)
+
 
 cdef class ZeroDCombustion:
     cdef CxxZeroDCombustion* solver

@@ -59,6 +59,8 @@ public:
     // Time-series data
     dvector timeVector; //!< Time [s] at the end of every ConfigOptions::outputStepInterval timesteps.
     dvector heatReleaseRate; //!< Integral heat release rate [W/m^2] at the times in #timeVector.
+    dvec gridPointIntegrationTimes; // Time taken to integrate each grid point [s]
+
 
     long int nTotal; //!< total number of timesteps taken
     int nRegrid; //!< number of time steps since regridding/adaptation

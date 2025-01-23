@@ -199,7 +199,7 @@ class EfficientTrainer:
             state = next_state
             episode_reward += np.mean(reward)
             episode_length += 1
-            episode_time += info.get('cpu_time', 0)
+            episode_time += np.sum(info.get('cpu_time', 0))
             if done or truncated:
                 if transitions_batch:
                     metrics = self._process_batch(transitions_batch)
@@ -271,6 +271,7 @@ class EfficientTrainer:
         os.makedirs(save_dir, exist_ok=True)
         
         eval_results = []
+        eval_times = []
         # for _ in range():  # Run multiple evaluation episodes
         state, _ = self.env.reset()
         total_reward = 0
@@ -282,11 +283,15 @@ class EfficientTrainer:
             while not done:
                 action, _, _ = self.agent.select_action(state, deterministic=True)
                 cvode_count, rk4_count = get_action_distribution(action)
-                if step % 100 == 0:
-                    print(f"Step {step} - CVODE: {cvode_count}, RK4: {rk4_count}")
                 actions_log.append(action)
-                next_state, reward, done, truncated, _ = self.env.step(action)
+                next_state, reward, done, truncated, info = self.env.step(action)
+                if step % 100 == 0:
+                    print(f"Step {step} - CVODE: {cvode_count}, RK4: {rk4_count} - "
+                          f"Reward: {np.mean(reward):.2f} - "
+                          f"CPU Time: {np.sum(info.get('cpu_time', 0)):.4f} - "
+                          f"Memory: {get_memory_usage():.2f} MB")
                 total_reward += np.mean(reward)
+                eval_times.append(np.sum(info.get('cpu_time', 0)))
                 state = next_state
                 step += 1
         eval_results.append(total_reward)
@@ -296,12 +301,14 @@ class EfficientTrainer:
             self.env.render(save_path=os.path.join(save_dir, f"episode_{episode}.png"))
         
         self._plot_actions(actions_log, episode, save_dir)
-        
+        print(f"Evaluation results: Total reward: {total_reward:.2f}")
         if self.config.track:
             wandb.log({
                 "eval/mean_reward": np.mean(eval_results),
-                "eval/std_reward": np.std(eval_results),
-                "eval/episode": episode
+                # "eval/std_reward": np.std(eval_results),
+                "eval/episode": episode,
+                "eval/mean_time": np.mean(eval_times),
+                # "eval/std_time": np.std(eval_times)
             })
             wandb.save(os.path.join(save_dir, f"episode_{episode}.png"))
             wandb.save(os.path.join(save_dir, f"actions_{episode}.png"))
@@ -345,7 +352,7 @@ class EfficientTrainer:
         print(
             f"Episode {episode} - Step: {step} - "
             f"Reward: {np.mean(reward):.2f} - "
-            f"Time: {info.get('cpu_time', 0):.4f} - "
+            f"Time: {np.sum(info.get('cpu_time', 0)):.4f} - "
             f"Actions: CVODE: {action_counts['CVODE']}, RK4: {action_counts['RK4']} - "
             f"Temp: {temperature:.3f} - "
             f"Memory: {get_memory_usage():.2f} MB"
@@ -371,7 +378,6 @@ class EfficientTrainer:
         })
 
 
-
 def plot_actions(actions, step, dir):
     """Plot actions"""
     times_to_plot = [10, 100, 1000, 2000, 3000, 4000, 5000, 5900]
@@ -390,10 +396,10 @@ if __name__ == "__main__":
         lr=3e-4,
         gamma=0.99,
         gae_lambda=0.95,
-        clip_ratio=0.2,
-        target_kl=0.015,
+        clip_ratio=0.3,
+        target_kl=0.03,
         n_epochs=10,
-        batch_size=300,
+        batch_size=512,
         value_coef=0.5,
         entropy_coef=0.05,
         buffer_size=10000
@@ -405,7 +411,7 @@ if __name__ == "__main__":
         cuda=True,
         track=True,
         total_timesteps=1000000,
-        batch_size=256,
+        batch_size=50,
         initial_temperature=2.0,
         final_temperature=0.5,
         temperature_decay_steps=300000,
@@ -441,13 +447,13 @@ if __name__ == "__main__":
         'local_features': True,
         'neighbor_features': True,
         'gradient_features': True,
-        'temporal_features': True,
+        'temporal_features': False,
         'window_size': 4
     }
 
     # Create environment
     sim_settings = SimulationSettings(
-        n_threads=2,
+        n_threads=3,
         output_dir=trainer_config.output_dir,
         t_end=trainer_config.t_end,
         n_points=trainer_config.n_points,

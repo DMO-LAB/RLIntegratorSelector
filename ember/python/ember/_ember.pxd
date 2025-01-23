@@ -249,6 +249,7 @@ cdef extern from "flameSolver.h":
         CxxEigenMatrix jFick
         CxxEigenMatrix jSoret
         CxxEigenVec phi
+        CxxEigenVec gridPointIntegrationTimes
 
 cdef extern from "zeroDCombustion.h":
     cdef cppclass CxxZeroDCombustion "ZeroDCombustion":

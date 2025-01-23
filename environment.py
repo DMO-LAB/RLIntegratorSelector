@@ -98,7 +98,7 @@ class SimulationData:
         self.phis = np.zeros((self.n_steps, self.n_points))
         self.spatial_points = np.zeros((self.n_steps, self.n_points))
         self.times = np.zeros(self.n_steps)
-        self.cpu_times = np.zeros(self.n_steps)
+        self.cpu_times = np.zeros((self.n_steps, self.n_points))
         self.integrator_types = [''] * self.n_steps
         self.errors = np.zeros((self.n_steps, self.n_points))
     
@@ -134,7 +134,7 @@ class SimulationData:
         self.phis = np.vstack([self.phis, np.zeros((extension, self.n_points))])
         self.spatial_points = np.vstack([self.spatial_points, np.zeros((extension, self.n_points))])
         self.times = np.concatenate([self.times, np.zeros(extension)])
-        self.cpu_times = np.concatenate([self.cpu_times, np.zeros(extension)])
+        self.cpu_times = np.concatenate([self.cpu_times, np.zeros((extension, self.n_points))])
         self.integrator_types.extend([''] * extension)
         self.errors = np.vstack([self.errors, np.zeros((extension, self.n_points))])
         #self.steps.extend([SimulationStep(step=0, time=0, temperatures=np.zeros((self.n_points,)), species_mass_fractions={}, phi=np.zeros(self.n_points), spatial_points=np.zeros(self.n_points), cpu_time=0, integrator_type='', error=np.zeros(self.n_points))] * extension)
@@ -281,7 +281,7 @@ def take_step(step_count, current_time, solver, data_holder, integrator_types, s
         },
         phi=solver.phi,
         spatial_points=solver.x,
-        cpu_time=cpu_time,
+        cpu_time=solver.gridPointIntegrationTimes,
         integrator_type=integrator_types,
         error=None
     )
@@ -703,12 +703,12 @@ class VectorizedCombustionEnv(gym.Env):
             total_error = point_error
         
         # Calculate reward using the new formulation
-        error_component = -np.log10(np.maximum(total_error, 1e-3))
-        time_scaling = np.exp(-cpu_time / 0.01) ** 0.1
-        time_component = -np.log10(cpu_time) if cpu_time > 0 else 0
+        error_component = -np.log10(np.maximum(total_error, 1e-10))
+        # time_scaling = np.exp(-cpu_time / 0.01) ** 0.1
+        time_component = -np.log10(np.maximum(cpu_time, 1e-10)) ** 0.5 if cpu_time > 0 else 0
         
         # Combine components
-        reward = error_component * time_scaling + time_component
+        reward = error_component * time_component * 0.01
         
         # Scale reward
         reward = scale_reward(reward)
@@ -741,7 +741,7 @@ class VectorizedCombustionEnv(gym.Env):
             self.solver.set_integrator_types(integrator_types)
             done = self.solver.step()
             
-            cpu_time = time.time() - start_time
+            cpu_time = self.solver.gridPointIntegrationTimes
             
             # Calculate errors and rewards for each point
             rewards = np.zeros(self.sim_settings.n_points)
@@ -750,9 +750,9 @@ class VectorizedCombustionEnv(gym.Env):
             for i in range(self.sim_settings.n_points):
                 T_error, species_errors, grad_error = self._calculate_point_error(i)
                 errors[i] = T_error + np.mean(list(species_errors.values())) + grad_error
-                rewards[i] = self._compute_point_reward(i, cpu_time, T_error, species_errors, grad_error,
+                rewards[i] = self._compute_point_reward(i, cpu_time[i], T_error, species_errors, grad_error,
                                                         neighbor_radius=self.reward_config['neighbor_radius'])
-                rewards[i] = rewards[i] - np.maximum(0, np.log10(np.maximum(errors[i], 1e-10)))
+                #rewards[i] = rewards[i] - np.maximum(0, np.log10(np.maximum(errors[i], 1e-10)))
             #     print(f"Reward {i}: {rewards[i]} - action: {action[i]} - error: {errors[i]} - cpu_time: {cpu_time}")
             # print(f"Sum of rewards at step {self.current_step}: {np.sum(rewards)}")
             # Update history

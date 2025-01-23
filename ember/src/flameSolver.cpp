@@ -25,31 +25,6 @@ FlameSolver::~FlameSolver() {
     // Clean up pointers
     delete strainfunc;
     delete rateMultiplierFunction;
-    
-    // // sourceTerms will be cleaned up by boost::ptr_vector's destructor
-    // sourceTerms.clear();
-    
-    // // Clear any other resources
-    // gases.clear();
-    
-    // // Clear callbacks
-    // if (stateWriter) {
-    //     delete stateWriter;
-    //     stateWriter = nullptr;
-    // }
-    // if (timeseriesWriter) {
-    //     delete timeseriesWriter;
-    //     timeseriesWriter = nullptr;
-    // }
-    // if (heatLossFunction) {
-    //     delete heatLossFunction;
-    //     heatLossFunction = nullptr;
-    // }
-    
-    // // Clear interpolators
-    // vzInterp.reset();
-    // vrInterp.reset();
-    // TInterp.reset();
 }
 
 void FlameSolver::setOptions(const ConfigOptions& _options)
@@ -500,35 +475,6 @@ SourceSystem* FlameSolver::createSourceSystem(const std::string& type, size_t j)
     return system;
 }
 
-// void FlameSolver::setIntegratorType(size_t j, const std::string& type) {
-//     if (j >= nPoints) {
-//         throw DebugException("Point index out of bounds");
-//     }
-
-//     // Only update if the type is actually changing
-//     if (pointIntegratorTypes[j] != type) {
-//         // Store old state
-//         double old_T = sourceTerms[j].T;
-//         vector<double> old_Y(sourceTerms[j].Y.data(), sourceTerms[j].Y.data() + nSpec);
-//         double old_U = sourceTerms[j].U;
-
-//         // Create new system
-//         SourceSystem* new_system = createSourceSystem(type, j);
-        
-//         // Transfer state
-//         new_system->T = old_T;
-//         new_system->U = old_U;
-//         for (size_t k = 0; k < nSpec; k++) {
-//             new_system->Y[k] = old_Y[k];
-//         }
-
-//         // Replace old system
-//         sourceTerms.replace(j, new_system);
-//         pointIntegratorTypes[j] = type;
-//         useCVODE[j] = (type == "cvode");
-//     }
-// }
-
 void FlameSolver::setIntegratorType(size_t j, const std::string& type) {
     if (j >= nPoints) {
         throw DebugException("Point index out of bounds");
@@ -634,6 +580,8 @@ void FlameSolver::resizeAuxiliary()
     hk.resize(nSpec, nPoints);
     jFick.setZero(nSpec, nPoints);
     jSoret.setZero(nSpec, nPoints);
+    gridPointIntegrationTimes.resize(nPoints);
+    gridPointIntegrationTimes.setZero();
 
     grid.jj = nPoints-1;
     grid.updateBoundaryIndices();
@@ -971,6 +919,9 @@ void FlameSolver::integrateProductionTerms(size_t j1, size_t j2)
 
     int err = 0;
     for (size_t j=j1; j<j2; j++) {
+        PerfTimer pointTimer;
+        pointTimer.start();
+
         SourceSystem& system = sourceTerms[j];
         logFile.verboseWrite(format("%i") % j, false);
         system.setGas(&gas);
@@ -992,6 +943,9 @@ void FlameSolver::integrateProductionTerms(size_t j1, size_t j2)
         } else {
             err = system.integrateToTime(tStageEnd - tStageStart);
         }
+
+        pointTimer.stop();
+        gridPointIntegrationTimes[j] = pointTimer.getTime();
         if (err >= 0) {
             logFile.verboseWrite(format(" [%s]...") % system.getStats(), false);
             sourceTerms[j].unroll_y();
