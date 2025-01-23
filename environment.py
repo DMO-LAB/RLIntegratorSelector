@@ -372,6 +372,38 @@ def run_benchmark(sim_settings: SimulationSettings,
         benchmark_data.save_to_hdf5(filename)
     return benchmark_data
 
+
+def scale_reward(reward: float) -> float:
+    """
+    Scale rewards to emphasize the difference between positive and negative values.
+    Positive values are rewarded, negative values are penalized more heavily.
+    
+    Args:
+        reward: Original reward value
+        
+    Returns:
+        float: Scaled reward value
+    """
+    if reward >= 0:
+        # For positive values, keep them positive but scale them
+        return np.exp(reward / 3) - 1  # Subtracting 1 to start from 0
+    else:
+        # For negative values, penalize exponentially
+        return -10 * (np.exp(abs(reward)) - 1)  # Multiplying by 2 to penalize more heavily
+
+# Example usage:
+def batch_scale_rewards(rewards: np.ndarray) -> np.ndarray:
+    """
+    Apply reward scaling to an array of rewards
+    
+    Args:
+        rewards: Array of original reward values
+        
+    Returns:
+        np.ndarray: Array of scaled reward values
+    """
+    return np.vectorize(scale_reward)(rewards)
+
 class VectorizedCombustionEnv(gym.Env):
     """
     Vectorized 1D combustion environment where each grid point is treated independently.
@@ -608,45 +640,91 @@ class VectorizedCombustionEnv(gym.Env):
         
         return T_error, species_errors, grad_error
     
+  
+    
     def _compute_point_reward(self, point_idx: int, cpu_time: float, 
-                            T_error: float, species_errors: dict, grad_error: float) -> float:
+                            T_error: float, species_errors: dict, grad_error: float,
+                            neighbor_radius: int = 4) -> float:
         """
-        Compute reward for a specific point with better scaling and stability
+        Compute reward for a specific point using error and CPU time based scaling,
+        with optional neighbor influence.
         
+        Args:
+            point_idx: Index of the current point
+            cpu_time: Computation time for the step
+            T_error: Temperature error at the point
+            species_errors: Dictionary of species errors
+            grad_error: Gradient error at the point
+            neighbor_radius: Number of neighboring points to consider on each side
+            
         Returns:
-            float: Reward value between -1 and 1
+            float: Combined reward value
         """
-        weights = self.reward_config['weights']
-        thresholds = self.reward_config['thresholds']
-        scaling = self.reward_config['scaling']
+        # Get neighbor influence settings from reward config
+        use_neighbors = self.reward_config.get('use_neighbors', False)
+        neighbor_weight = self.reward_config.get('neighbor_weight', 0.3)
         
-        # Compute normalized errors (between 0 and 1)
-        norm_T_error = np.minimum(1.0, T_error / thresholds['error'])
-        norm_species_errors = np.minimum(1.0, 
-            np.mean([error / thresholds['error'] for error in species_errors.values()]))
-        norm_grad_error = np.minimum(1.0, grad_error / thresholds['error'])
+        # Calculate point error (combining temperature, species, and gradient errors)
+        point_error = T_error + np.mean(list(species_errors.values())) + grad_error
         
-        # Combined error metric (0 = no error, 1 = max error)
-        total_error = (norm_T_error + norm_species_errors + norm_grad_error) / 3
+        if use_neighbors:
+            # Get neighboring points indices
+            n_points = self.sim_settings.n_points
+            start_idx = max(0, point_idx - neighbor_radius)
+            end_idx = min(n_points, point_idx + neighbor_radius + 1)
+            neighbor_indices = [idx for idx in range(start_idx, end_idx) if idx != point_idx]
+            
+            # Calculate neighbor errors
+            neighbor_errors = []
+            neighbor_weights = []
+            
+            for idx in neighbor_indices:
+                T_err, spec_err, grad_err = self._calculate_point_error(idx)
+                total_err = T_err + np.mean(list(spec_err.values())) + grad_err
+                neighbor_errors.append(total_err)
+                
+                # Calculate distance-based weight
+                distance = abs(idx - point_idx)
+                weight = np.exp(-distance / neighbor_radius)
+                neighbor_weights.append(weight)
+                
+            # Convert to numpy arrays and normalize weights
+            if neighbor_errors:
+                neighbor_errors = np.array(neighbor_errors)
+                neighbor_weights = np.array(neighbor_weights)
+                neighbor_weights = neighbor_weights / np.sum(neighbor_weights)
+                
+                # Combine errors with neighbor influence
+                total_error = (1 - neighbor_weight) * point_error + \
+                            neighbor_weight * np.sum(neighbor_errors * neighbor_weights)
+            else:
+                total_error = point_error
+        else:
+            total_error = point_error
         
-        # Accuracy reward component (-1 to 1)
-        accuracy_reward = weights['accuracy'] * (2 * np.exp(-scaling['error'] * total_error) - 1)
+        # Calculate reward using the new formulation
+        error_component = -np.log10(np.maximum(total_error, 1e-3))
+        time_scaling = np.exp(-cpu_time / 0.01) ** 0.1
+        time_component = -np.log10(cpu_time) if cpu_time > 0 else 0
         
-        # Normalize CPU time (0 to 1)
-        norm_time = np.minimum(1.0, cpu_time / thresholds['time'])
+        # Combine components
+        reward = error_component * time_scaling + time_component
         
-        # Efficiency reward component (-1 to 1) 
-        efficiency_reward = weights['efficiency'] * (2 * np.exp(-scaling['time'] * norm_time) - 1)
-        
-        # Combine rewards
-        reward = accuracy_reward + efficiency_reward
-        
-        # Add stability penalty for very large errors
-        if total_error > 0.8:  # Only penalize severe errors
-            stability_penalty = -weights['stability'] * (total_error - 0.8) * 5
-            reward += stability_penalty
+        # Scale reward
+        reward = scale_reward(reward)
         
         return reward
+
+    def _setup_default_reward_config(self):
+        """Setup default reward configuration"""
+        return {
+            'use_neighbors': True,           # Whether to use neighbor influence
+            'neighbor_weight': 0.3,          # Weight of neighbor influence (0 to 1)
+            'neighbor_radius': 2,            # Number of neighbors to consider on each side
+            'error_threshold': 1e-3,         # Minimum error threshold
+            'time_threshold': 0.01,          # Time scaling threshold
+            'time_exponent': 0.1,           # Exponent for time scaling
+        }
     
     def step(self, action: np.ndarray):
         """Take a step using different integrators for each point"""
@@ -672,7 +750,8 @@ class VectorizedCombustionEnv(gym.Env):
             for i in range(self.sim_settings.n_points):
                 T_error, species_errors, grad_error = self._calculate_point_error(i)
                 errors[i] = T_error + np.mean(list(species_errors.values())) + grad_error
-                rewards[i] = self._compute_point_reward(i, cpu_time, T_error, species_errors, grad_error)
+                rewards[i] = self._compute_point_reward(i, cpu_time, T_error, species_errors, grad_error,
+                                                        neighbor_radius=self.reward_config['neighbor_radius'])
                 #rewards[i] = rewards[i] - np.maximum(0, np.log10(np.maximum(errors[i], 1e-10))/2)
             #     print(f"Reward {i}: {rewards[i]} - action: {action[i]} - error: {errors[i]} - cpu_time: {cpu_time}")
             # print(f"Sum of rewards at step {self.current_step}: {np.sum(rewards)}")

@@ -43,12 +43,35 @@ def test_environment_memory():
         profile_interval=args.profile_interval
     )
     
+    reward_config = {
+            'weights': {
+                'accuracy': 1,
+                'efficiency': 3,
+            },
+            'thresholds': {
+                'time': 0.001,
+                'error': 1
+            },
+            'scaling': {
+                'time': 1,
+                'error': 1
+            }
+        }
+
+    features_config = {
+            'local_features': True,
+            'neighbor_features': True,
+            'gradient_features': True,
+            'temporal_features': True,
+            'window_size': 4
+        }
+    
     env = create_env(
         sim_settings,
         benchmark_file='env_benchmark.h5',
         species_to_track=['CH4', 'O2', 'CO2', 'H2O'],
-        features_config=None,
-        reward_config=None,
+        features_config=features_config,
+        reward_config=reward_config,
         save_step_data=False
     )
     
