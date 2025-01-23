@@ -752,7 +752,7 @@ class VectorizedCombustionEnv(gym.Env):
                 errors[i] = T_error + np.mean(list(species_errors.values())) + grad_error
                 rewards[i] = self._compute_point_reward(i, cpu_time, T_error, species_errors, grad_error,
                                                         neighbor_radius=self.reward_config['neighbor_radius'])
-                #rewards[i] = rewards[i] - np.maximum(0, np.log10(np.maximum(errors[i], 1e-10))/2)
+                rewards[i] = rewards[i] - np.maximum(0, np.log10(np.maximum(errors[i], 1e-10)))
             #     print(f"Reward {i}: {rewards[i]} - action: {action[i]} - error: {errors[i]} - cpu_time: {cpu_time}")
             # print(f"Sum of rewards at step {self.current_step}: {np.sum(rewards)}")
             # Update history
@@ -796,6 +796,7 @@ class VectorizedCombustionEnv(gym.Env):
                 done = True
                 truncated = True
                 
+                rewards = rewards - np.maximum(0, np.log10(np.maximum(errors, 1e-10))) * 100
                 # delete the output directory
                 import shutil
                 shutil.rmtree(self.sim_settings.output_dir)

@@ -87,6 +87,8 @@ class EfficientTrainer:
         start_time = time.time()
         global_step = 0
         episode = 0
+        self.episode_cummulative_rewards = []
+        self.episode_total_times = []
         
         while global_step < self.config.total_timesteps:
             # Calculate temperature for exploration
@@ -96,6 +98,17 @@ class EfficientTrainer:
             episode_metrics = self._run_episode(episode, global_step, start_time, temperature)
             global_step += episode_metrics['length']
             episode += 1
+            self.episode_cummulative_rewards.append(episode_metrics['reward'])
+            self.episode_total_times.append(episode_metrics['time'])
+            if self.config.track:
+                wandb.log({
+                    "episode/reward": episode_metrics['reward'],
+                    "episode/length": episode_metrics['length'],
+                    "episode/time": episode_metrics['time']
+                })
+            
+            if episode % 10 == 0:
+                self.plot_episode_metrics()
             
             memory_cleanup()
         
@@ -104,6 +117,23 @@ class EfficientTrainer:
             wandb.finish()
         
         return self.agent
+    
+    def plot_episode_metrics(self):
+        """Plot episode metrics"""
+        fig, axs = plt.subplots(2, 1, figsize=(10, 8))
+        axs[0].plot(self.episode_cummulative_rewards, label='Cummulative Rewards')
+        axs[0].set_title('Cummulative Rewards')
+        axs[0].set_xlabel('Episode')
+        axs[0].set_ylabel('Reward')
+        axs[0].legend()
+        
+        axs[1].plot(self.episode_total_times, label='Total Time')
+        axs[1].set_title('Total Time')
+        axs[1].set_xlabel('Episode')
+        axs[1].set_ylabel('Time')
+        axs[1].legend()
+        plt.savefig(os.path.join(self.config.save_dir, 'episode_metrics.png'))
+        plt.close()
     
     def _get_temperature(self, step: int) -> float:
         """Calculate exploration temperature based on training progress"""
@@ -120,6 +150,7 @@ class EfficientTrainer:
         state, _ = self.env.reset()
         episode_reward = 0
         episode_length = 0
+        episode_time = 0
         episode_metrics = defaultdict(float)
         transitions_batch = []
         action_counts = {'CVODE': 0, 'RK4': 0}
@@ -168,7 +199,7 @@ class EfficientTrainer:
             state = next_state
             episode_reward += np.mean(reward)
             episode_length += 1
-            
+            episode_time += info.get('cpu_time', 0)
             if done or truncated:
                 if transitions_batch:
                     metrics = self._process_batch(transitions_batch)
@@ -192,7 +223,8 @@ class EfficientTrainer:
         return {
             'reward': episode_reward,
             'length': episode_length,
-            'metrics': episode_metrics
+            'metrics': episode_metrics,
+            'time': episode_time
         }
     
     def _select_action_with_temperature(self, state: np.ndarray, 
@@ -361,10 +393,10 @@ if __name__ == "__main__":
         clip_ratio=0.2,
         target_kl=0.015,
         n_epochs=10,
-        batch_size=64,
+        batch_size=300,
         value_coef=0.5,
         entropy_coef=0.05,
-        buffer_size=300
+        buffer_size=10000
     )
     
     # Trainer Configuration
@@ -373,7 +405,7 @@ if __name__ == "__main__":
         cuda=True,
         track=True,
         total_timesteps=1000000,
-        batch_size=150,
+        batch_size=256,
         initial_temperature=2.0,
         final_temperature=0.5,
         temperature_decay_steps=300000,
@@ -428,8 +460,8 @@ if __name__ == "__main__":
     
     env = create_env(
         sim_settings,
-        benchmark_file='env_benchmark.h5',
-        species_to_track=['CH4', 'O2', 'CO2', 'H2O'],
+        benchmark_file='env_benchmark_new.h5',
+        species_to_track=['HO2', 'O', 'H2O2', 'OH', 'H', 'O2', 'H2', 'H2O'],
         features_config=features_config,
         reward_config=reward_config,
         save_step_data=False
@@ -439,7 +471,7 @@ if __name__ == "__main__":
     agent = PPOAgent(
         obs_dim=env.observation_space.shape[1],
         n_actions=len(env.integrator_options),
-        hidden_dims=[64, 64],
+        hidden_dims=[512, 256, 128],
         config=ppo_config,
         device="cuda" if trainer_config.cuda and torch.cuda.is_available() else "cpu"
     )
