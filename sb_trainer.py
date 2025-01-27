@@ -261,7 +261,6 @@ class EfficientTrainer:
             )
         
         metrics = self.agent.update()
-        print(f"Batch processed - Memory after: {get_memory_usage():.2f} MB")
         return metrics
     
     def _evaluate(self, episode: int):
@@ -276,7 +275,8 @@ class EfficientTrainer:
         state, _ = self.env.reset()
         total_reward = 0
         actions_log = []
-        
+        episode_rewards_per_point = []
+        total_episode_rewards = []
         with torch.no_grad():
             done = False
             step = 0
@@ -285,6 +285,9 @@ class EfficientTrainer:
                 cvode_count, rk4_count = get_action_distribution(action)
                 actions_log.append(action)
                 next_state, reward, done, truncated, info = self.env.step(action)
+                episode_rewards_per_point.append(reward)
+                total_episode_rewards.append(np.mean(reward))
+                
                 if step % 100 == 0:
                     print(f"Step {step} - CVODE: {cvode_count}, RK4: {rk4_count} - "
                           f"Reward: {np.mean(reward):.2f} - "
@@ -299,6 +302,17 @@ class EfficientTrainer:
         # Save evaluation results
         if hasattr(self.env, 'render'):
             self.env.render(save_path=os.path.join(save_dir, f"episode_{episode}.png"))
+
+        self._plot_rewards(episode_rewards_per_point, episode, save_dir)
+
+        fig, ax = plt.subplots()
+        total_episode_rewards = np.array(total_episode_rewards)
+        ax.plot(total_episode_rewards[0:-2])
+        ax.set_title('Total Episode Rewards')
+        ax.set_xlabel('Episode')
+        ax.set_ylabel('Reward')
+        plt.savefig(os.path.join(save_dir, f"total_episode_rewards_{episode}.png"))
+        plt.close()
         
         self._plot_actions(actions_log, episode, save_dir)
         print(f"Evaluation results: Total reward: {total_reward:.2f}")
@@ -312,7 +326,8 @@ class EfficientTrainer:
             })
             wandb.save(os.path.join(save_dir, f"episode_{episode}.png"))
             wandb.save(os.path.join(save_dir, f"actions_{episode}.png"))
-        
+            wandb.save(os.path.join(save_dir, f"rewards_{episode}.png"))
+            wandb.save(os.path.join(save_dir, f"total_episode_rewards_{episode}.png"))
         return np.mean(eval_results)
     
     def _plot_actions(self, actions, episode, save_dir):
@@ -329,6 +344,22 @@ class EfficientTrainer:
         
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"actions_{episode}.png"))
+        plt.close()
+        
+    def _plot_rewards(self, rewards, episode, save_dir):
+        """Plot actions distribution over time"""
+        times_to_plot = [10, 100, 1000, 2000, 3000, 4000, 5000, 5900]
+        fig, axs = plt.subplots(len(times_to_plot)//2, 2, figsize=(12, 8))
+        
+        for i, time in enumerate(times_to_plot):
+            if time < len(rewards):
+                axs[i//2, i%2].plot(rewards[time])
+                axs[i//2, i%2].set_title(f"Time: {time}")
+                axs[i//2, i%2].set_ylim(-0.5, 1.5)
+                axs[i//2, i%2].set_ylabel("Reward")
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f"rewards_{episode}.png"))
         plt.close()
     
     def save_model(self, step: int, final: bool = False):
@@ -393,7 +424,7 @@ def plot_actions(actions, step, dir):
 if __name__ == "__main__":
     # PPO Configuration
     ppo_config = PPOConfig(
-        lr=3e-4,
+        lr=1e-4,
         gamma=0.99,
         gae_lambda=0.95,
         clip_ratio=0.3,
@@ -401,7 +432,7 @@ if __name__ == "__main__":
         n_epochs=10,
         batch_size=512,
         value_coef=0.5,
-        entropy_coef=0.05,
+        entropy_coef=0.1,
         buffer_size=10000
     )
     
@@ -411,7 +442,7 @@ if __name__ == "__main__":
         cuda=True,
         track=True,
         total_timesteps=1000000,
-        batch_size=50,
+        batch_size=600,
         initial_temperature=2.0,
         final_temperature=0.5,
         temperature_decay_steps=300000,
@@ -445,7 +476,7 @@ if __name__ == "__main__":
 
     features_config = {
         'local_features': True,
-        'neighbor_features': True,
+        'neighbor_features': False,
         'gradient_features': True,
         'temporal_features': False,
         'window_size': 4
@@ -453,7 +484,7 @@ if __name__ == "__main__":
 
     # Create environment
     sim_settings = SimulationSettings(
-        n_threads=3,
+        n_threads=2,
         output_dir=trainer_config.output_dir,
         t_end=trainer_config.t_end,
         n_points=trainer_config.n_points,
@@ -466,8 +497,8 @@ if __name__ == "__main__":
     
     env = create_env(
         sim_settings,
-        benchmark_file='env_benchmark_new.h5',
-        species_to_track=['HO2', 'O', 'H2O2', 'OH', 'H', 'O2', 'H2', 'H2O'],
+        benchmark_file='env_benchmark2.h5',
+        species_to_track=['CH4', 'CO2', 'HO2', 'H2O2', 'OH', 'O2', 'H2', 'H2O'],
         features_config=features_config,
         reward_config=reward_config,
         save_step_data=False
@@ -477,7 +508,7 @@ if __name__ == "__main__":
     agent = PPOAgent(
         obs_dim=env.observation_space.shape[1],
         n_actions=len(env.integrator_options),
-        hidden_dims=[512, 256, 128],
+        hidden_dims=[512, 256, 256, 128],
         config=ppo_config,
         device="cuda" if trainer_config.cuda and torch.cuda.is_available() else "cpu"
     )

@@ -617,6 +617,30 @@ class VectorizedCombustionEnv(gym.Env):
             self._get_point_observation(i) 
             for i in range(self.sim_settings.n_points)
         ])
+        
+    def reward_function(self, error, cpu_time):
+        # Normalize errors to typical ranges
+        log_error = -np.log10(max(error, 1e-20))
+        log_time = -np.log10(max(cpu_time, 1e-10))
+        
+        # Sigmoid scaling for error component
+        error_component = 2.0 / (1 + np.exp(-log_error)) - 1
+        
+        # Logarithmic scaling for time
+        time_component = log_time / 10.0  # Normalize to ~[-1,1] range
+        
+        # Combined reward with adaptive weighting
+        error_weight = 0.7 + 0.3 * (error > 50)  # Increase weight in reaction zones
+        time_weight = 1.0 - error_weight
+        
+        reward = error_weight * error_component + time_weight * time_component
+        
+        # Additional penalty for catastrophic errors
+        if error > 50:
+            reward -= 0.3
+            
+        return reward
+
     
     def _calculate_point_error(self, point_idx: int) -> Tuple[float, dict]:
         """Calculate error metrics for a specific point"""
@@ -640,80 +664,43 @@ class VectorizedCombustionEnv(gym.Env):
         
         return T_error, species_errors, grad_error
     
-  
-    
     def _compute_point_reward(self, point_idx: int, cpu_time: float, 
-                            T_error: float, species_errors: dict, grad_error: float,
-                            neighbor_radius: int = 4) -> float:
-        """
-        Compute reward for a specific point using error and CPU time based scaling,
-        with optional neighbor influence.
-        
-        Args:
-            point_idx: Index of the current point
-            cpu_time: Computation time for the step
-            T_error: Temperature error at the point
-            species_errors: Dictionary of species errors
-            grad_error: Gradient error at the point
-            neighbor_radius: Number of neighboring points to consider on each side
-            
-        Returns:
-            float: Combined reward value
-        """
-        # Get neighbor influence settings from reward config
-        use_neighbors = self.reward_config.get('use_neighbors', False)
-        neighbor_weight = self.reward_config.get('neighbor_weight', 0.3)
-        
-        # Calculate point error (combining temperature, species, and gradient errors)
+                         T_error: float, species_errors: dict, grad_error: float,
+                         neighbor_radius: int = 4) -> float:
+        """Compute reward for a specific point"""
+        # Calculate total error including neighbors if enabled
         point_error = T_error + np.mean(list(species_errors.values())) + grad_error
         
-        if use_neighbors:
-            # Get neighboring points indices
+        if self.reward_config.get('use_neighbors', False):
+            # Get neighboring points and their errors
             n_points = self.sim_settings.n_points
             start_idx = max(0, point_idx - neighbor_radius)
             end_idx = min(n_points, point_idx + neighbor_radius + 1)
-            neighbor_indices = [idx for idx in range(start_idx, end_idx) if idx != point_idx]
             
-            # Calculate neighbor errors
             neighbor_errors = []
             neighbor_weights = []
+            for idx in range(start_idx, end_idx):
+                if idx != point_idx:
+                    T_err, spec_err, grad_err = self._calculate_point_error(idx)
+                    total_err = T_err + np.mean(list(spec_err.values())) + grad_err
+                    neighbor_errors.append(total_err)
+                    
+                    distance = abs(idx - point_idx)
+                    weight = np.exp(-distance / neighbor_radius)
+                    neighbor_weights.append(weight)
             
-            for idx in neighbor_indices:
-                T_err, spec_err, grad_err = self._calculate_point_error(idx)
-                total_err = T_err + np.mean(list(spec_err.values())) + grad_err
-                neighbor_errors.append(total_err)
-                
-                # Calculate distance-based weight
-                distance = abs(idx - point_idx)
-                weight = np.exp(-distance / neighbor_radius)
-                neighbor_weights.append(weight)
-                
-            # Convert to numpy arrays and normalize weights
             if neighbor_errors:
-                neighbor_errors = np.array(neighbor_errors)
                 neighbor_weights = np.array(neighbor_weights)
-                neighbor_weights = neighbor_weights / np.sum(neighbor_weights)
-                
-                # Combine errors with neighbor influence
-                total_error = (1 - neighbor_weight) * point_error + \
-                            neighbor_weight * np.sum(neighbor_errors * neighbor_weights)
+                neighbor_weights /= np.sum(neighbor_weights)
+                total_error = (1 - self.reward_config['neighbor_weight']) * point_error + \
+                            self.reward_config['neighbor_weight'] * np.sum(np.array(neighbor_errors) * neighbor_weights)
             else:
                 total_error = point_error
         else:
             total_error = point_error
-        
-        # Calculate reward using the new formulation
-        error_component = -np.log10(np.maximum(total_error, 1e-10))
-        # time_scaling = np.exp(-cpu_time / 0.01) ** 0.1
-        time_component = -np.log10(np.maximum(cpu_time, 1e-10)) ** 0.5 if cpu_time > 0 else 0
-        
-        # Combine components
-        reward = error_component * time_component * 0.01
-        
-        # Scale reward
-        reward = scale_reward(reward)
-        
-        return reward
+
+        # Use new reward computation
+        return self.reward_function(total_error, cpu_time)
 
     def _setup_default_reward_config(self):
         """Setup default reward configuration"""
