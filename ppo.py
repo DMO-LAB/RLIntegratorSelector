@@ -22,58 +22,60 @@ class PPOConfig:
     buffer_size: int = 300
 
 class MemoryBuffer:
-    """Efficient memory buffer using pre-allocated numpy arrays"""
-    def __init__(self, buffer_size: int):
-        self.buffer_size = buffer_size
-        self.ptr = 0
-        self.size = 0
-        self._arrays: Dict[str, Optional[np.ndarray]] = {
-            'states': None,
-            'actions': None,
-            'log_probs': None,
-            'values': None,
-            'rewards': None,
-            'dones': None
+    """Memory buffer that grows dynamically without a fixed size limit."""
+    def __init__(self):
+        self._arrays: Dict[str, List[np.ndarray]] = {
+            'states': [],
+            'actions': [],
+            'log_probs': [],
+            'values': [],
+            'rewards': [],
+            'dones': []
         }
 
-    def _initialize_arrays(self, sample_batch: Dict[str, np.ndarray]) -> None:
-        """Initialize arrays with correct shapes from sample batch"""
-        for key, sample in sample_batch.items():
-            shape = sample.shape[1:] if len(sample.shape) > 1 else ()
-            dtype = sample.dtype
-            self._arrays[key] = np.zeros((self.buffer_size,) + shape, dtype=dtype)
-
     def store(self, batch: Dict[str, np.ndarray]) -> None:
-        """Store a batch of transitions"""
-        if self._arrays['states'] is None:
-            self._initialize_arrays(batch)
-
-        batch_size = len(next(iter(batch.values())))
-        if self.ptr + batch_size > self.buffer_size:
-            # Handle wrapping
-            first_part = self.buffer_size - self.ptr
-            for key, data in batch.items():
-                self._arrays[key][self.ptr:] = data[:first_part]
-                self._arrays[key][:batch_size-first_part] = data[first_part:]
-            self.ptr = batch_size - first_part
-        else:
-            # Normal storage
-            for key, data in batch.items():
-                self._arrays[key][self.ptr:self.ptr+batch_size] = data
-            self.ptr = (self.ptr + batch_size) % self.buffer_size
-
-        self.size = min(self.size + batch_size, self.buffer_size)
+        """
+        Store a batch of transitions in lists. 
+        Ensures all data is properly shaped before storing.
+        """
+        for key, data in batch.items():
+            # Convert to numpy array if not already
+            data = np.asarray(data)
+            # Ensure data is at least 1D
+            if data.ndim == 0:
+                # Scalar value - reshape to 1D array with length 1
+                data = np.array([data])
+            elif data.ndim == 1:
+                # For 1D arrays, add a new axis if they're singular
+                if len(data) == 1:
+                    data = data.reshape(1, -1)
+            self._arrays[key].append(data)
 
     def get_all(self) -> Optional[Tuple[np.ndarray, ...]]:
-        """Get all stored transitions"""
-        if self.size == 0:
+        """
+        Get all stored transitions as concatenated NumPy arrays.
+        Returns None if no data is stored.
+        """
+        if len(self._arrays['states']) == 0:
             return None
-        return tuple(arr[:self.size] for arr in self._arrays.values())
+        
+        try:
+            return tuple(
+                np.concatenate(self._arrays[key], axis=0)
+                for key in self._arrays
+            )
+        except ValueError as e:
+            # Debug information
+            shapes = {key: [arr.shape for arr in self._arrays[key]] 
+                     for key in self._arrays}
+            print(f"Error concatenating arrays. Shapes: {shapes}")
+            raise e
 
     def clear(self) -> None:
-        """Reset buffer pointers"""
-        self.ptr = 0
-        self.size = 0
+        """Reset buffer: clear all lists."""
+        for key in self._arrays:
+            self._arrays[key] = []
+
 
 class SharedNetwork(nn.Module):
     """Shared feature extractor for policy and value networks"""
@@ -119,7 +121,7 @@ class PPOAgent:
         )
         
         # Memory buffer
-        self.memory = MemoryBuffer(config.buffer_size)
+        self.memory = MemoryBuffer()
         
     def _to_tensor(self, array: np.ndarray) -> torch.Tensor:
         """Convert numpy array to torch tensor on correct device"""
@@ -295,6 +297,7 @@ class PPOAgent:
             torch.cuda.empty_cache()
         
         # Average metrics
+        print(f"Update complete with metrics: {metrics}")
         return {k: v/n_updates if n_updates > 0 else 0 for k, v in metrics.items()}
 
     def save(self, path: str) -> None:

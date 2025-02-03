@@ -4,290 +4,20 @@ import numpy as np
 import cantera as ct
 import time
 import pickle
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Union
 from collections import deque
 from ember import Config, Paths, InitialCondition, StrainParameters, General, \
     Times, TerminationCondition, ConcreteConfig, Debug, RK23Tolerances, QssTolerances, CvodeTolerances, _ember
-
-from typing import Optional, Dict, List
-import numpy as np
-import h5py
-
-def get_memory_usage():
-    """Get current memory usage in MB"""
-    import psutil
-    import os
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss / 1024 / 1024
-
-@dataclass
-class IntegratorOption:
-    """Class to represent integrator options"""
-    name: str
-    type: str  # 'cvode' or 'boostRK'
-    rtol: float
-    atol: float
-    color: str
-    
-
-@dataclass
-class SimulationSettings:
-    """General simulation settings"""
-    output_dir: str = 'run/diffusion_benchmark'
-    n_threads: int = 2
-    global_timestep: float = 1e-6
-    profile_interval: int = 20
-    t_end: float = 0.08
-    n_points: int = 100
-    x_left: float = -0.02
-    x_right: float = 0.02
-    T_fuel: float = 600
-    T_oxidizer: float = 1200
-    pressure: float = 101325
-    strain_rate: float = 100
-    
-import numpy as np
+from stable_baselines3.common.vec_env import VecEnv
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 import h5py
 import os
 from datetime import datetime
-
-@dataclass
-class SimulationStep:
-    """Class to hold data for a single simulation step"""
-    step: int
-    time: float
-    temperatures: np.ndarray
-    species_mass_fractions: Dict[str, np.ndarray]
-    phi: np.ndarray
-    spatial_points: np.ndarray
-    cpu_time: float
-    integrator_type: str
-    error: np.ndarray
-
-@dataclass
-class SimulationData:
-    """Class to manage and store simulation data efficiently"""
-    species_names: List[str]
-    n_points: int
-    n_steps: int
-    output_dir: str
-    
-    # Initialize storage arrays
-    temperatures: np.ndarray = field(init=False)
-    species_mass_fractions: Dict[str, np.ndarray] = field(init=False)
-    phis: np.ndarray = field(init=False)
-    spatial_points: np.ndarray = field(init=False)
-    times: np.ndarray = field(init=False)
-    cpu_times: np.ndarray = field(init=False)
-    integrator_types: List[str] = field(init=False)
-    errors: np.ndarray = field(init=False)
-    current_step: int = field(init=False, default=0)
-    #steps: List[SimulationStep] = field(init=False, default_factory=list)
-
-    
-    def __post_init__(self):
-        """Initialize storage arrays after object creation"""
-        self.temperatures = np.zeros((self.n_steps, self.n_points))
-        self.species_mass_fractions = {
-            spec: np.zeros((self.n_steps, self.n_points)) 
-            for spec in self.species_names
-        }
-        self.phis = np.zeros((self.n_steps, self.n_points))
-        self.spatial_points = np.zeros((self.n_steps, self.n_points))
-        self.times = np.zeros(self.n_steps)
-        self.cpu_times = np.zeros((self.n_steps, self.n_points))
-        self.integrator_types = [''] * self.n_steps
-        self.errors = np.zeros((self.n_steps, self.n_points))
-    
-    def add_step(self, step_data: SimulationStep) -> None:
-        """Add data for a single simulation step"""
-        if self.current_step >= self.n_steps:
-            self._extend_arrays()
-        
-        idx = self.current_step
-        self.temperatures[idx] = step_data.temperatures
-        for spec, mass_frac in step_data.species_mass_fractions.items():
-            self.species_mass_fractions[spec][idx] = mass_frac
-        self.phis[idx] = step_data.phi
-        self.spatial_points[idx] = step_data.spatial_points
-        self.times[idx] = step_data.time
-        self.cpu_times[idx] = step_data.cpu_time
-        self.integrator_types[idx] = step_data.integrator_type
-        #self.steps.append(step_data)
-        if step_data.error is not None:
-            self.errors[idx] = step_data.error
-        
-        self.current_step += 1
-    
-    def _extend_arrays(self) -> None:
-        """Extend storage arrays when needed"""
-        extension = self.n_steps
-        self.temperatures = np.vstack([self.temperatures, np.zeros((extension, self.n_points))])
-        for spec in self.species_names:
-            self.species_mass_fractions[spec] = np.vstack([
-                self.species_mass_fractions[spec], 
-                np.zeros((extension, self.n_points))
-            ])
-        self.phis = np.vstack([self.phis, np.zeros((extension, self.n_points))])
-        self.spatial_points = np.vstack([self.spatial_points, np.zeros((extension, self.n_points))])
-        self.times = np.concatenate([self.times, np.zeros(extension)])
-        self.cpu_times = np.concatenate([self.cpu_times, np.zeros((extension, self.n_points))])
-        self.integrator_types.extend([''] * extension)
-        self.errors = np.vstack([self.errors, np.zeros((extension, self.n_points))])
-        #self.steps.extend([SimulationStep(step=0, time=0, temperatures=np.zeros((self.n_points,)), species_mass_fractions={}, phi=np.zeros(self.n_points), spatial_points=np.zeros(self.n_points), cpu_time=0, integrator_type='', error=np.zeros(self.n_points))] * extension)
-        self.n_steps += extension
-    
-    def get_step(self, step: int) -> SimulationStep:
-        """Get data for a specific step"""
-        if step > self.current_step:
-            raise IndexError(f"Step {step} not available. Current step is {self.current_step}")
-        
-        return SimulationStep(
-            step=step,
-            time=self.times[step],
-            temperatures=self.temperatures[step],
-            species_mass_fractions={
-                spec: self.species_mass_fractions[spec][step]
-                for spec in self.species_names
-            },
-            phi=self.phis[step],
-            spatial_points=self.spatial_points[step],
-            cpu_time=self.cpu_times[step],
-            integrator_type=self.integrator_types[step],
-            error=self.errors[step]
-        )
-    
-    def save_to_hdf5(self, filename: Optional[str] = None) -> str:
-        """Save simulation data to HDF5 file"""
-        if filename is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = os.path.join(self.output_dir, f"simulation_data_{timestamp}.h5")
-        
-        # os.makedirs(os.path.dirname(filename), exist_ok=True)
-        
-        with h5py.File(filename, 'w') as f:
-            # Create groups
-            meta = f.create_group('metadata')
-            data = f.create_group('data')
-            
-            # Store metadata
-            meta.attrs['n_points'] = self.n_points
-            meta.attrs['n_steps'] = self.n_steps
-            meta.attrs['current_step'] = self.current_step
-            meta.create_dataset('species_names', data=np.array(self.species_names, dtype='S'))
-            
-            # Store simulation data
-            data.create_dataset('temperatures', data=self.temperatures[:self.current_step])
-            data.create_dataset('phis', data=self.phis[:self.current_step])
-            data.create_dataset('spatial_points', data=self.spatial_points[:self.current_step])
-            data.create_dataset('times', data=self.times[:self.current_step])
-            data.create_dataset('cpu_times', data=self.cpu_times[:self.current_step])
-            data.create_dataset('errors', data=self.errors[:self.current_step])
-            data.create_dataset('integrator_types', 
-                              data=np.array(self.integrator_types[:self.current_step], dtype='S'))
-            
-            # Store species data in a separate group
-            species_group = data.create_group('species')
-            for spec in self.species_names:
-                species_group.create_dataset(
-                    spec, 
-                    data=self.species_mass_fractions[spec][:self.current_step]
-                )
-        
-        return filename
-    
-    @classmethod
-    def load_from_hdf5(cls, filename: str) -> 'SimulationData':
-        """Load simulation data from HDF5 file"""
-        with h5py.File(filename, 'r') as f:
-            # Load metadata
-            meta = f['metadata']
-            n_points = meta.attrs['n_points']
-            n_steps = meta.attrs['n_steps']
-            species_names = [name.decode() for name in meta['species_names']]
-            
-            # Create instance
-            output_dir = os.path.dirname(filename)
-            instance = cls(species_names, n_points, n_steps, output_dir)
-            
-            # Load data
-            data = f['data']
-            instance.temperatures = data['temperatures'][:]
-            instance.phis = data['phis'][:]
-            instance.spatial_points = data['spatial_points'][:]
-            instance.times = data['times'][:]
-            instance.cpu_times = data['cpu_times'][:]
-            instance.errors = data['errors'][:]
-            instance.integrator_types = [
-                name for name in data['integrator_types'][:]
-            ]
-            
-            # Load species data
-            species_group = data['species']
-            for spec in species_names:
-                instance.species_mass_fractions[spec] = species_group[spec][:]
-            
-            instance.current_step = meta.attrs['current_step']
-        
-        return instance
-    
-    def get_species_profile(self, species_name: str, step: Optional[int] = None) -> np.ndarray:
-        """Get mass fraction profile for a specific species"""
-        if species_name not in self.species_names:
-            raise ValueError(f"Species {species_name} not found in simulation data")
-        
-        if step is None:
-            return self.species_mass_fractions[species_name][:self.current_step]
-        return self.species_mass_fractions[species_name][step]
-    
-    def get_temperature_profile(self, step: Optional[int] = None) -> np.ndarray:
-        """Get temperature profile"""
-        if step is None:
-            return self.temperatures[:self.current_step]
-        return self.temperatures[step]
-    
-    def get_phi_profile(self, step: Optional[int] = None) -> np.ndarray:
-        """Get equivalence ratio profile"""
-        if step is None:
-            return self.phis[:self.current_step]
-        return self.phis[step]
-    
-    def get_performance_metrics(self) -> Dict:
-        """Calculate and return performance metrics"""
-        return {
-            'total_cpu_time': np.sum(self.cpu_times[:self.current_step]),
-            'mean_cpu_time': np.mean(self.cpu_times[:self.current_step]),
-            'max_error': np.max(self.errors[:self.current_step]),
-            'mean_error': np.mean(self.errors[:self.current_step]),
-            'integrator_usage': dict(zip(
-                *np.unique(self.integrator_types[:self.current_step], return_counts=True)
-            ))
-        }
-
-def take_step(step_count, current_time, solver, data_holder, integrator_types, species_index, species_names):
-    start_time = time.time()
-    done = solver.step()
-    end_time = time.time()
-    cpu_time = end_time - start_time
-    step_data = SimulationStep(
-        step=step_count,
-        time=current_time,
-        temperatures=solver.T,
-        species_mass_fractions={
-            spec: solver.Y[species_index[spec]] for spec in species_names
-        },
-        phi=solver.phi,
-        spatial_points=solver.x,
-        cpu_time=solver.gridPointIntegrationTimes,
-        integrator_type=integrator_types,
-        error=None
-    )
-    data_holder.add_step(step_data)
-    return data_holder, done, cpu_time
-
+from utils import take_step, SimulationStep, SimulationData, SimulationSettings, IntegratorOption
+import hashlib
+import json
+from tqdm import tqdm
 def _create_config(sim_settings: SimulationSettings, rtol=1e-6, atol=1e-8):
         """Create Ember configuration"""
         os.makedirs(sim_settings.output_dir, exist_ok=True)
@@ -348,7 +78,7 @@ def run_benchmark(sim_settings: SimulationSettings,
     benchmark_data = SimulationData(
         species_names=species_to_track,
         n_points=sim_settings.n_points,
-        n_steps=sim_settings.n_points,
+        n_steps=int(sim_settings.t_end / sim_settings.global_timestep),
         output_dir=output_dir
     )
     
@@ -365,44 +95,17 @@ def run_benchmark(sim_settings: SimulationSettings,
         # Run simulation
         step_count = 0
         done = False
+        start_time = time.time()
+        print(f"[INFO] Running benchmark simulation with {sim_settings.n_points} points")
         while not done:
             current_time = step_count * sim_settings.global_timestep
             data_holder, done, cpu_time = take_step(step_count, current_time, solver, benchmark_data, integrator_types, species_index, species_to_track)
             step_count += 1
+        end_time = time.time()
         benchmark_data.save_to_hdf5(filename)
+        print(f"[INFO] Benchmark simulation completed in {end_time - start_time:.2f} seconds and ended at step {step_count}")
     return benchmark_data
 
-
-def scale_reward(reward: float) -> float:
-    """
-    Scale rewards to emphasize the difference between positive and negative values.
-    Positive values are rewarded, negative values are penalized more heavily.
-    
-    Args:
-        reward: Original reward value
-        
-    Returns:
-        float: Scaled reward value
-    """
-    if reward >= 0:
-        # For positive values, keep them positive but scale them
-        return np.exp(reward / 3) - 1  # Subtracting 1 to start from 0
-    else:
-        # For negative values, penalize exponentially
-        return -10 * (np.exp(abs(reward)) - 1)  # Multiplying by 2 to penalize more heavily
-
-# Example usage:
-def batch_scale_rewards(rewards: np.ndarray) -> np.ndarray:
-    """
-    Apply reward scaling to an array of rewards
-    
-    Args:
-        rewards: Array of original reward values
-        
-    Returns:
-        np.ndarray: Array of scaled reward values
-    """
-    return np.vectorize(scale_reward)(rewards)
 
 class VectorizedCombustionEnv(gym.Env):
     """
@@ -564,10 +267,10 @@ class VectorizedCombustionEnv(gym.Env):
         
         if self.features_config['local_features']:
             # Local temperature and species
-            features.append(self.solver.T[point_idx] / self.sim_settings.T_oxidizer)
+            features.append(self.solver.T[point_idx] / 300)
             for spec in self.species_to_track:
                 Y = self.solver.Y[self.species_indices[spec]][point_idx]
-                features.append(np.log10(max(abs(Y), 1e-20)))
+                features.append(Y)
             
             # Local phi
             phi = self.solver.phi[point_idx]
@@ -579,19 +282,19 @@ class VectorizedCombustionEnv(gym.Env):
             # Add features from neighboring points
             for offset in [-1, 1]:
                 idx = max(0, min(point_idx + offset, self.sim_settings.n_points - 1))
-                features.append(self.solver.T[idx] / self.sim_settings.T_oxidizer)
+                features.append(self.solver.T[idx] / 300)
                 for spec in self.species_to_track:
                     Y = self.solver.Y[self.species_indices[spec]][idx]
-                    features.append(np.log10(max(abs(Y), 1e-10)))
+                    features.append(Y)
 
         if self.features_config['gradient_features']:
             # Local gradients
             dT = np.gradient(self.solver.T)[point_idx]
-            features.append(np.log10(max(abs(dT), 1e-10)))
+            features.append(np.log1p(np.abs(dT)))
             
             for spec in self.species_to_track:
                 dY = np.gradient(self.solver.Y[self.species_indices[spec]])[point_idx]
-                features.append(np.log10(max(abs(dY), 1e-20)))
+                features.append(np.log1p(np.abs(dY)))
         
         if self.features_config['temporal_features']:
             # Historical features
@@ -621,47 +324,51 @@ class VectorizedCombustionEnv(gym.Env):
     def reward_function(self, error, cpu_time):
         # Normalize errors to typical ranges
         log_error = -np.log10(max(error, 1e-20))
-        log_time = -np.log10(max(cpu_time, 1e-10))
-        
+        log_time = -np.log10(max(cpu_time, 1e-7))
+
         # Sigmoid scaling for error component
         error_component = 2.0 / (1 + np.exp(-log_error)) - 1
-        
+
         # Logarithmic scaling for time
-        time_component = log_time / 10.0  # Normalize to ~[-1,1] range
-        
+        time_component = log_time  # Normalize to ~[-1,1] range
+
         # Combined reward with adaptive weighting
-        error_weight = 0.7 + 0.3 * (error > 50)  # Increase weight in reaction zones
-        time_weight = 1.0 - error_weight
-        
+        error_weight = 0.4 + 0.6 * (error > 10)  # Increase weight in reaction zones
+        time_weight = (1.0 - error_weight) 
+
         reward = error_weight * error_component + time_weight * time_component
-        
+
         # Additional penalty for catastrophic errors
-        if error > 50:
-            reward -= 0.3
-            
-        return reward
+        if error > 10:
+            reward += log_error*10
+                
+        return reward * 0.1
 
     
-    def _calculate_point_error(self, point_idx: int) -> Tuple[float, dict]:
+    def _calculate_point_error(self, point_idx: int) -> Tuple[float, dict, float]:
         """Calculate error metrics for a specific point"""
         benchmark_step = self.benchmark_data.get_step(self.current_step)
         
-        # Temperature error
-        T_error = abs(self.solver.T[point_idx] - 
-                     benchmark_step.temperatures[point_idx])
+        # Temperature relative error (as percentage)
+        benchmark_T = benchmark_step.temperatures[point_idx]
+        T_error = abs(self.solver.T[point_idx] - benchmark_T) / benchmark_T * 100
         
-        # Species errors
+        # Species relative errors (as percentage)
         species_errors = {}
         for spec in self.species_to_track:
             current_Y = self.solver.Y[self.species_indices[spec]][point_idx]
             bench_Y = benchmark_step.species_mass_fractions[spec][point_idx]
-            species_errors[spec] = abs(current_Y - bench_Y)
+            # Add small epsilon to avoid division by zero for trace species
+            epsilon = np.max([bench_Y, 1e-5])
+            species_errors[spec] = abs(current_Y - bench_Y) / epsilon * 100
         
-        # Gradient error
+        # Gradient relative error (as percentage)
         current_grad = np.gradient(self.solver.T)[point_idx]
         bench_grad = np.gradient(benchmark_step.temperatures)[point_idx]
-        grad_error = abs(current_grad - bench_grad)
-        
+        # Add small epsilon to avoid division by zero at flat regions
+        epsilon = np.max([bench_grad, 1e-5])
+        grad_error = abs(current_grad - bench_grad) / epsilon * 100
+
         return T_error, species_errors, grad_error
     
     def _compute_point_reward(self, point_idx: int, cpu_time: float, 
@@ -721,12 +428,14 @@ class VectorizedCombustionEnv(gym.Env):
             for a in action:
                 integrator = self.integrator_options[a]
                 integrator_types.append(integrator.type)
-            
+        
             self.last_action = action
             # Take step
             start_time = time.time()
             self.solver.set_integrator_types(integrator_types)
             done = self.solver.step()
+
+            truncated = False
             
             cpu_time = self.solver.gridPointIntegrationTimes
             
@@ -739,9 +448,7 @@ class VectorizedCombustionEnv(gym.Env):
                 errors[i] = T_error + np.mean(list(species_errors.values())) + grad_error
                 rewards[i] = self._compute_point_reward(i, cpu_time[i], T_error, species_errors, grad_error,
                                                         neighbor_radius=self.reward_config['neighbor_radius'])
-                #rewards[i] = rewards[i] - np.maximum(0, np.log10(np.maximum(errors[i], 1e-10)))
-            #     print(f"Reward {i}: {rewards[i]} - action: {action[i]} - error: {errors[i]} - cpu_time: {cpu_time}")
-            # print(f"Sum of rewards at step {self.current_step}: {np.sum(rewards)}")
+                rewards[i] = rewards[i] - np.maximum(0, np.log10(np.maximum(errors[i], 1e-10)))/10
             # Update history
             self._update_history()
             
@@ -766,14 +473,8 @@ class VectorizedCombustionEnv(gym.Env):
             # Get next observation
             observation = self._get_observation()
             
-            # Prepare info dictionary
-            info = {
-                'cpu_time': cpu_time,
-                'point_errors': errors,
-                'point_rewards': rewards,
-                'total_time': self.episode_data.get_performance_metrics()['total_cpu_time'] if self.save_step_data else 0,
-                'action': action
-            }
+            info = [{'cpu_time': cpu_time[i], 'point_errors': errors[i], 'point_rewards': rewards[i], 'action': action[i],
+                    'integrator_type': self.integrator_options[action[i]].name} for i in range(self.sim_settings.n_points)]
             
             self.current_step += 1
             
@@ -782,13 +483,12 @@ class VectorizedCombustionEnv(gym.Env):
                 print(f"Episode Done {self.current_step} - resetting environment")
                 done = True
                 truncated = True
-                
                 rewards = rewards - np.maximum(0, np.log10(np.maximum(errors, 1e-10))) * 100
                 # delete the output directory
                 import shutil
-                shutil.rmtree(self.sim_settings.output_dir)
-
-                # rewards = rewards - errors
+                if os.path.exists(self.sim_settings.output_dir):
+                   
+                    shutil.rmtree(self.sim_settings.output_dir)
             else:
                 truncated = False
                 
@@ -826,6 +526,8 @@ class VectorizedCombustionEnv(gym.Env):
         self.current_step = 1
         self.end_step = int(self.sim_settings.t_end / self.sim_settings.global_timestep)
         self._initialize_history()
+
+        print(f"[CRITICAL INFO] Resetting environment with current step {self.current_step} and end step {self.end_step} - benchmark data steps {self.benchmark_data.n_steps}")
         
         return self._get_observation(), {}
     
@@ -840,7 +542,14 @@ class VectorizedCombustionEnv(gym.Env):
         # Temperature profile
         ax1 = fig.add_subplot(gs[0, :])
         ax1.plot(self.solver.x, self.solver.T, 'b-', label='Current')
-        ax1.plot(self.solver.x, self.benchmark_data.get_step(self.current_step).temperatures, 
+        # check the max step in the benchmark data
+        if self.current_step >= self.benchmark_data.n_steps:
+            current_step = self.benchmark_data.n_steps - 1
+            print(f"[WARNING] Current step {self.current_step} is greater than benchmark data steps {self.benchmark_data.n_steps}, using last step")
+        else:
+            print(f"[INFO] Current step {self.current_step} is less than benchmark data steps {self.benchmark_data.n_steps}, using current step")
+            current_step = self.current_step
+        ax1.plot(self.solver.x, self.benchmark_data.get_step(current_step).temperatures, 
                 'k--', label='Benchmark')
         ax1.set_ylabel('Temperature (K)')
         ax1.set_title('Temperature Profile')
@@ -848,9 +557,10 @@ class VectorizedCombustionEnv(gym.Env):
         
         # Species profiles
         ax2 = fig.add_subplot(gs[1, :])
-        for spec in self.species_to_track:
+        for spec in ['CH4', 'O2', 'H2O']:
             current_Y = self.solver.Y[self.species_indices[spec]]
-            benchmark_Y = self.benchmark_data.get_step(self.current_step).species_mass_fractions[spec]
+
+            benchmark_Y = self.benchmark_data.get_step(current_step).species_mass_fractions[spec]
             ax2.semilogy(self.solver.x, current_Y, '-', label=f'{spec} Current')
             ax2.semilogy(self.solver.x, benchmark_Y, '--', label=f'{spec} Benchmark')
         ax2.set_ylabel('Mass Fractions')
@@ -860,7 +570,7 @@ class VectorizedCombustionEnv(gym.Env):
         # Error distribution
         ax3 = fig.add_subplot(gs[2, 0])
         T_errors = np.abs(self.solver.T - 
-                         self.benchmark_data.get_step(self.current_step).temperatures)
+                         self.benchmark_data.get_step(current_step).temperatures)
         ax3.plot(self.solver.x, T_errors, 'r-', label='Temperature Error')
         ax3.set_xlabel('Position (m)')
         ax3.set_ylabel('Absolute Error')
@@ -970,6 +680,100 @@ class VectorizedCombustionEnv(gym.Env):
         """Save episode data"""
         self.episode_data.save_to_hdf5(filename)
 
+
+class VectorizedGridEnvWrapper(VecEnv):
+    def __init__(self, env):
+        # Create a new observation space that represents a single point
+        single_point_obs_space = env.observation_space
+        if len(single_point_obs_space.shape) > 1:
+            # If shape is (n_points, obs_dim), take just obs_dim
+            single_point_obs_space = spaces.Box(
+                low=env.observation_space.low[0],
+                high=env.observation_space.high[0],
+                shape=(env.observation_space.shape[1],),
+                dtype=env.observation_space.dtype
+            )
+        
+        # Make sure action space is a single Discrete space per point
+        if isinstance(env.action_space, spaces.MultiDiscrete):
+            action_space = spaces.Discrete(env.action_space.nvec[0])
+        else:
+            action_space = env.action_space
+
+        super().__init__(
+            num_envs=env.sim_settings.n_points,
+            observation_space=single_point_obs_space,
+            action_space=action_space  # Use single point action space
+        )
+        self.env = env
+        self.sim_settings = env.sim_settings
+        self.needs_reset = False
+    def step_async(self, actions):
+        if self.needs_reset:
+            # Reset environment if needed
+            self._last_obs, _ = self.env.reset()
+            self.needs_reset = False
+            
+        # Ensure actions are 1D array of length num_envs
+        if len(actions.shape) > 1:
+            actions = actions.flatten()
+        self.actions = actions.astype(np.int32)
+        
+    def step_wait(self):
+        obs, rewards, dones, truncated, infos = self.env.step(self.actions)
+        # Ensure observations are properly shaped
+        if len(obs.shape) == 2:
+            obs = obs.reshape(self.num_envs, -1)
+    
+        if dones:
+            self.needs_reset = True
+        dones = np.full(self.num_envs, dones)
+        
+        # Create proper info dict
+        if not isinstance(infos, list):
+            infos = [infos for _ in range(self.num_envs)]
+            
+        return obs, rewards, dones, infos
+    
+    def reset(self, seed=None, options=None):
+        if self.needs_reset:
+            print("Resetting environment from sb3")
+            obs, info = self.env.reset(seed=seed, options=options)
+            self.needs_reset = False
+        else:
+            obs, info = self.env.reset()
+        # Ensure observations are properly shaped
+        if len(obs.shape) == 2:  # If obs is (n_points, obs_dim)
+            obs = obs.reshape(self.num_envs, -1)  # Reshape to (n_envs, obs_dim)
+        return obs
+    
+    def close(self):
+        self.env.close()
+        
+    def env_is_wrapped(self, wrapper_class, indices=None):
+        """Check if environment is wrapped"""
+        return False
+        
+    def env_method(self, method_name, *method_args, indices=None, **method_kwargs):
+        """Call environment method"""
+        return [getattr(self.env, method_name)(*method_args, **method_kwargs) 
+                for _ in range(self.num_envs)]
+    
+    def get_attr(self, attr_name, indices=None):
+        """Get environment attribute"""
+        return [getattr(self.env, attr_name) for _ in range(self.num_envs)]
+    
+    def set_attr(self, attr_name, value, indices=None):
+        """Set environment attribute"""
+        setattr(self.env, attr_name, value)
+
+    
+    def seed(self, seed=None):
+        """Set environment seed"""
+        if hasattr(self.env, 'seed'):
+            return [self.env.seed(seed) for _ in range(self.num_envs)]
+        return [None for _ in range(self.num_envs)]
+
 def create_env(sim_settings: SimulationSettings,
               benchmark_file: str = None,
               species_to_track: List[str] = None,
@@ -1002,65 +806,217 @@ def create_env(sim_settings: SimulationSettings,
         save_step_data=save_step_data
     )
     
+    env = VectorizedGridEnvWrapper(env)
     return env
 
 
-if __name__ == "__main__":
-    # Create simulation settings
-    sim_settings = SimulationSettings(
-        output_dir='run/rl_test',
-        t_end=0.06,
-        n_points=100,
-        T_fuel=600,
-        T_oxidizer=1200,
-        pressure=101325,
-        global_timestep=1e-5,
-        profile_interval=20
-    )
+@dataclass
+class SimulationConfig:
+    """Class to hold variable simulation parameters"""
+    T_fuel: float
+    T_oxidizer: float
+    t_end: float
+    pressure: float
+    center_width: float
+    slope_width: float
+    equilibrate_counterflow: Union[bool, str]
 
-    # Create environment
-    env = create_env(
-        sim_settings=sim_settings,
-        benchmark_file='run/rl_test/benchmark.h5',
+    def get_hash(self) -> str:
+        """Generate a unique hash for this configuration"""
+        # Only include T_fuel and T_oxidizer in hash since t_end doesn't affect physics
+        config_dict = {
+            'T_fuel': self.T_fuel,
+            'T_oxidizer': self.T_oxidizer,
+            'pressure': self.pressure,
+            'center_width': self.center_width,
+            'slope_width': self.slope_width,
+            'equilibrate_counterflow': self.equilibrate_counterflow
+        }
+        config_str = json.dumps(config_dict, sort_keys=True)
+        return hashlib.md5(config_str.encode()).hexdigest()
+
+class BenchmarkCache:
+    """Class to manage cached benchmark simulations"""
+    def __init__(self, cache_dir: str = 'benchmark_cache'):
+        self.cache_dir = cache_dir
+        os.makedirs(cache_dir, exist_ok=True)
+        
+    def get_cache_path(self, config: SimulationConfig) -> str:
+        """Get path for cached benchmark file"""
+        config_hash = config.get_hash()
+        return os.path.join(self.cache_dir, f'benchmark_{config_hash}.h5')
+    
+    def is_cached(self, config: SimulationConfig) -> bool:
+        """Check if benchmark exists in cache"""
+        cache_path = self.get_cache_path(config)
+        return os.path.exists(cache_path)
+    
+    def get_cached_benchmark(self, config: SimulationConfig) -> Optional[str]:
+        """Get path to cached benchmark if it exists"""
+        if self.is_cached(config):
+            return self.get_cache_path(config)
+        return None
+
+def create_randomized_env(base_settings: SimulationSettings,
+                         sim_configs: List[SimulationConfig],
+                         species_to_track: List[str] = None,
+                         features_config: dict = None,
+                         reward_config: dict = None,
+                         save_step_data: bool = False) -> VectorizedCombustionEnv:
+    """Create environment with support for randomized episodes"""
+    
+    # Initialize benchmark cache
+    cache = BenchmarkCache()
+    
+    # Create modified environment class with randomization support
+    class RandomizedCombustionEnv(VectorizedCombustionEnv):
+        def __init__(self, *args, **kwargs):
+            self.sim_configs = sim_configs
+            self.cache = cache
+            self.current_config = None
+            super().__init__(*args, **kwargs)
+        
+        def reset(self, seed=None, options=None):
+            """Reset with random simulation config"""
+            import numpy as np
+            
+            # Select random config
+            if seed is not None:
+                np.random.seed(seed)
+            self.current_config = np.random.choice(self.sim_configs)
+            
+            # Update simulation settings
+            self.sim_settings.T_fuel = self.current_config.T_fuel
+            self.sim_settings.T_oxidizer = self.current_config.T_oxidizer
+            self.sim_settings.t_end = self.current_config.t_end
+            self.sim_settings.pressure = self.current_config.pressure
+            self.sim_settings.center_width = self.current_config.center_width
+            self.sim_settings.slope_width = self.current_config.slope_width
+            self.sim_settings.equilibrate_counterflow = self.current_config.equilibrate_counterflow
+            # Check for cached benchmark
+            benchmark_path = self.cache.get_cached_benchmark(self.current_config)
+
+            
+            if benchmark_path is None:
+                # Run new benchmark if not cached
+                print(f"[INFO] Running new benchmark for config: T_fuel={self.current_config.T_fuel}, "
+                      f"T_oxidizer={self.current_config.T_oxidizer}, "
+                      f"t_end={self.current_config.t_end}, "
+                      f"pressure={self.current_config.pressure}, "
+                      f"center_width={self.current_config.center_width}, "
+                      f"slope_width={self.current_config.slope_width}, "
+                      f"equilibrate_counterflow={self.current_config.equilibrate_counterflow}")
+                benchmark_path = self.cache.get_cache_path(self.current_config)
+                self.benchmark_data = run_benchmark(
+                    sim_settings=self.sim_settings,
+                    species_to_track=self.species_to_track,
+                    species_index=self.species_index,
+                    output_dir='benchmarks',
+                    filename=benchmark_path
+                )
+            else:
+                # Load cached benchmark
+                print(f"[INFO] Loading cached benchmark for config: T_fuel={self.current_config.T_fuel}, "
+                      f"T_oxidizer={self.current_config.T_oxidizer}, "
+                      f"t_end={self.current_config.t_end}, "
+                      f"pressure={self.current_config.pressure}, "
+                      f"center_width={self.current_config.center_width}, "
+                      f"slope_width={self.current_config.slope_width}, "
+                      f"equilibrate_counterflow={self.current_config.equilibrate_counterflow}")
+                self.benchmark_data = SimulationData.load_from_hdf5(benchmark_path)
+            
+            return super().reset(seed=seed)
+    
+
+    gas = ct.Solution('gri30.yaml')
+    species_to_track = species_to_track if species_to_track is not None else ['CH4', 'O2', 'CO2', 'H2O']
+    species_index = {spec: gas.species_index(spec) for spec in species_to_track} 
+    # Create environment instance
+    env = RandomizedCombustionEnv(
+        sim_settings=base_settings,
+        benchmark_data=None,  # Will be set in reset()
+        species_to_track=species_to_track,
+        species_index=species_index,
+        features_config=features_config,
+        reward_config=reward_config,
+        save_step_data=save_step_data
+    )
+    
+    env = VectorizedGridEnvWrapper(env)
+    return env
+
+# Example usage:
+if __name__ == "__main__":
+    # Base simulation settings
+    base_settings = SimulationSettings(
+        output_dir='run/rl_test',
+        n_points=100,
+        global_timestep=1e-5,
+        profile_interval=20,
+        equilibrate_counterflow=False,
+        center_width=0.002,
+        slope_width=0.001
+    )
+    
+    # Define possible simulation configurations
+    sim_configs = [
+        SimulationConfig(T_fuel=300, T_oxidizer=1200, t_end=0.05, pressure=101325, equilibrate_counterflow=False, center_width=0, slope_width=0),
+        SimulationConfig(T_fuel=600, T_oxidizer=1300, t_end=0.05, pressure=101325, equilibrate_counterflow=False, center_width=0, slope_width=0),
+        SimulationConfig(T_fuel=900, T_oxidizer=1100, t_end=0.05, pressure=101325, equilibrate_counterflow=False, center_width=0, slope_width=0),
+        # SimulationConfig(T_fuel=1200, T_oxidizer=1000, t_end=0.025, pressure=101325, equilibrate_counterflow=False, center_width=0, slope_width=0),
+        SimulationConfig(T_fuel=450, T_oxidizer=1500, t_end=0.05, pressure=101325, equilibrate_counterflow=False, center_width=0, slope_width=0),
+        # SimulationConfig(T_fuel=750, T_oxidizer=1400, t_end=0.05, pressure=101325, equilibrate_counterflow=False, center_width=0, slope_width=0),
+        # SimulationConfig(T_fuel=1050, T_oxidizer=1200, t_end=0.05, pressure=101325, equilibrate_counterflow=False, center_width=0, slope_width=0),
+        # SimulationConfig(T_fuel=1350, T_oxidizer=1200, t_end=0.03, pressure=101325, equilibrate_counterflow=False, center_width=0, slope_width=0),
+        SimulationConfig(T_fuel=1500, T_oxidizer=1500, t_end=0.05, pressure=101325, equilibrate_counterflow=False, center_width=0, slope_width=0),
+
+        SimulationConfig(T_fuel=300, T_oxidizer=1200, t_end=0.05, pressure=101325, equilibrate_counterflow='TP', center_width=0.002, slope_width=0.001),
+        # SimulationConfig(T_fuel=600, T_oxidizer=1300, t_end=0.05, pressure=101325, equilibrate_counterflow='TP', center_width=0.001, slope_width=0.0005),
+        SimulationConfig(T_fuel=900, T_oxidizer=1100, t_end=0.05, pressure=101325, equilibrate_counterflow='TP', center_width=0.001, slope_width=0.0005),
+        SimulationConfig(T_fuel=1200, T_oxidizer=1000, t_end=0.05, pressure=101325, equilibrate_counterflow='TP', center_width=0.005, slope_width=0.001),
+        # SimulationConfig(T_fuel=450, T_oxidizer=1500, t_end=0.04, pressure=101325, equilibrate_counterflow='TP', center_width=0.001, slope_width=0.0005),
+        # SimulationConfig(T_fuel=750, T_oxidizer=1400, t_end=0.04, pressure=101325, equilibrate_counterflow='TP', center_width=0.001, slope_width=0.0005),
+        SimulationConfig(T_fuel=1050, T_oxidizer=1200, t_end=0.05, pressure=101325, equilibrate_counterflow='TP', center_width=0.001, slope_width=0.0005),
+        SimulationConfig(T_fuel=1350, T_oxidizer=1200, t_end=0.05, pressure=101325, equilibrate_counterflow='TP', center_width=0.008, slope_width=0.003),
+        #SimulationConfig(T_fuel=1500, T_oxidizer=1500, t_end=0.01, pressure=101325, equilibrate_counterflow='TP', center_width=0.001, slope_width=0.0005),
+    ]
+    
+    # Create randomized environment
+    env = create_randomized_env(
+        base_settings=base_settings,
+        sim_configs=sim_configs,
         species_to_track=['CH4', 'O2', 'CO2', 'H2O'],
         features_config={
             'local_features': True,
             'neighbor_features': True,
             'gradient_features': True,
             'temporal_features': True,
-            'window_size': 5  
+            'window_size': 5
         },
-        reward_config={
-            'weights': {
-                'accuracy': 0.4,
-                'efficiency': 0.3,
-                'stability': 0.3
-            },
-            'thresholds': {
-                'time': 0.01,
-                'error': 1e-3
-            },
-            'scaling': {
-                'time': 0.1,
-                'error': 1.0
-            }
-        }
+        reward_config = {
+        'weights': {
+            'accuracy': 1,
+            'efficiency': 3,
+        },
+        'thresholds': {
+            'time': 0.001,
+            'error': 1
+        },
+        'scaling': {
+            'time': 1,
+            'error': 1
+        },
+        'use_neighbors': True,
+        'neighbor_weight': 0.3,
+        'neighbor_radius': 4
+    }
     )
     
-    obs, info = env.reset()
-    done = False
-    total_errors = np.zeros(sim_settings.n_points)
-    total_rewards = np.zeros(sim_settings.n_points)
-    while not done:
-        action = [1] * 100
-        obs, rewards, done, truncated, info = env.step(action)
-        total_errors += info['point_errors']
-        total_rewards += info['point_rewards']
-    
-    print(f"Total errors: {total_errors}")
-    print(f"Total rewards: {total_rewards}")
-    
-    np.savetxt('run/rl_test/cvode_total_errors.txt', total_errors)
-    np.savetxt('run/rl_test/cvode_total_rewards.txt', total_rewards)
-    
-    env.save_episode_data('run/rl_test/episode_data_cvode.h5')
+    # Test environment
+    for episode in range(3):
+        obs = env.reset(seed=episode)
+        done = False
+        while not done:
+            action = np.zeros(100, dtype=int)  # Default actions
+            obs, rewards, done, info = env.step(action)
+            done = np.any(done)

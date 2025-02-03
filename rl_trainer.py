@@ -1,339 +1,99 @@
-from dataclasses import dataclass
-from typing import Literal
-from ppo import PPOAgent, PPOConfig
-from sac import DiscreteSAC, SACConfig
-import os
-import time
-import numpy as np
-from collections import defaultdict
-from environment import VectorizedCombustionEnv
-import torch
 import wandb
+import numpy as np
+import torch
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+from stable_baselines3.common.logger import configure
+import os
 from datetime import datetime
-from typing import Optional, Dict
 import matplotlib.pyplot as plt
-from environment import SimulationSettings, create_env
-import argparse
-from typing import List, Tuple
-import psutil
+from environment import create_randomized_env, SimulationSettings, SimulationConfig
+from typing import Optional
+import shutil
+from config import TrainingConfig, create_default_config, NetworkConfig, PPOConfig, FeatureConfig, RewardConfig
 
-
-def get_action_distribution(action):
-    cvode_count = np.sum(action == 0)
-    rk4_count = np.sum(action == 1)
-    return cvode_count, rk4_count
-
-def get_memory_usage() -> float:
-    """Get current memory usage in MB"""
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss / 1024 / 1024
-
-@dataclass
-class TrainerConfig:
-    """Training configuration"""
-    algorithm: Literal["PPO", "SAC"] = "PPO"
-    exp_name: str = "combustion_rl_1d"
-    seed: int = 1
-    cuda: bool = True
-    track: bool = True
-    wandb_project_name: str = "combustion_control_1d"
-    wandb_entity: Optional[str] = None
-    output_dir: str = 'RL_output'
-    save_dir: str = f'experiments/{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}'
-    total_timesteps: int = 1000000
-    batch_size: int = 300
-    eval_freq: int = 2
-    save_freq: int = 2
-    max_memory_threshold: int = 2000  # MB
+class CombustionCallback(BaseCallback):
+    def __init__(self, eval_env, log_dir: str, eval_freq: int = 1000):
+        super().__init__(verbose=1)
+        self.eval_env = eval_env
+        self.log_dir = log_dir
+        self.eval_freq = eval_freq
+        self.best_mean_reward = -np.inf
+        self.n_steps = 0
+        
+        # Create directories
+        self.plot_dir = os.path.join(log_dir, "plots")
+        os.makedirs(self.plot_dir, exist_ok=True)
     
-    # PPO-specific parameters
-    initial_temperature: float = 2.0  # For PPO exploration
-    final_temperature: float = 0.1
-    temperature_decay_steps: int = 500000
-    
-    # Environment parameters
-    n_points: int = 100
-    T_fuel: float = 1000
-    T_oxidizer: float = 1000
-    pressure: float = 101325
-    global_timestep: float = 1e-5
-    profile_interval: float = 100
-    t_end: float = 0.06
+    def _on_step(self) -> bool:
+        self.n_steps += self.eval_env.num_envs
 
-class EfficientTrainer:
-    def __init__(self, env, agent, config: TrainerConfig):
-        self.env = env
-        self.agent = agent
-        self.config = config
-        self.device = agent.device
-        
-        os.makedirs(self.config.output_dir, exist_ok=True)
-        os.makedirs(self.config.save_dir, exist_ok=True)
-        
-        if self.config.track:
-            self._init_wandb()
-            
-    def _init_wandb(self):
-        wandb.init(
-            project=self.config.wandb_project_name,
-            entity=self.config.wandb_entity,
-            config=vars(self.config),
-            name=f"{self.config.exp_name}_{self.config.seed}_{int(time.time())}",
-            monitor_gym=True,
-            save_code=True,
-        )
-    
-    def plot_episode_metrics(self):
-        """Plot episode metrics"""
-        fig, axs = plt.subplots(2, 1, figsize=(10, 8))
-        axs[0].plot(self.episode_cumulative_rewards, label='Cummulative Rewards')
-        axs[0].set_title('Cummulative Rewards')
-        axs[0].set_xlabel('Episode')
-        axs[0].set_ylabel('Reward')
-        axs[0].legend()
-        
-        axs[1].plot(self.episode_total_times, label='Total Time')
-        axs[1].set_title('Total Time')
-        axs[1].set_xlabel('Episode')
-        axs[1].set_ylabel('Time')
-        axs[1].legend()
-        plt.savefig(os.path.join(self.config.save_dir, 'episode_metrics.png'))
-        plt.close()
-    
-    def _get_temperature(self, step: int) -> float:
-        """Calculate exploration temperature based on training progress"""
-        progress = min(step / self.config.temperature_decay_steps, 1.0)
-        return self.config.initial_temperature + \
-               (self.config.final_temperature - self.config.initial_temperature) * progress    
+        if self.n_steps % self.eval_freq == 0:
+            print(f"\nEvaluating at step {self.n_steps}...")
+            self._evaluate()
+            path = os.path.join(self.log_dir, f"model_step_{self.n_steps}.zip")
+            self.model.save(path)
+            print(f"Model saved to {path}")
 
-    def _run_episode(self, episode: int, global_step: int, start_time: float, 
-                    temperature: float = 1) -> Dict:
-        print(f"\nStarting episode {episode} with memory: {get_memory_usage():.2f} MB")
-        
-        state, _ = self.env.reset()
-        episode_reward = 0
-        episode_length = 0
-        episode_time = 0
-        episode_metrics = defaultdict(float)
-        action_counts = defaultdict(int)
-        
-        done = False
-        while not done:
-            # Select action based on algorithm
-            if isinstance(self.agent, PPOAgent):
-                action, log_prob, value = self._select_action_with_temperature(
-                    state, temperature
-                )
-    
-            else:  # SAC
-                action = self.agent.select_action(state)
-                
-            cvode_count, rk4_count = get_action_distribution(action)
-            action_counts['CVODE'] = cvode_count
-            action_counts['RK4'] = rk4_count
-            
-            # Step environment
-            next_state, reward, done, truncated, info = self.env.step(action)
-            
-            # Store transition based on algorithm
-            if isinstance(self.agent, PPOAgent):
-                self.agent.store_transition(
-                    state, action, log_prob, value, reward, done
-                )
-            else:  # SAC
-                self.agent.store_transition(
-                    state, action, reward, next_state, done
-                )
-            
-            # Update based on algorithm
-            if isinstance(self.agent, PPOAgent):
-                if self.agent.memory.size >= self.config.batch_size or done:
-                    metrics = self.agent.update()
-                    for k, v in metrics.items():
-                        episode_metrics[k] += v
-            else:  # SAC updates every step
-                if episode_length % self.agent.config.batch_size == 0:
-                    metrics = self.agent.update()
-                    for k, v in metrics.items():
-                        episode_metrics[k] += v
-            
-            if episode_length % 500 == 0:
-                self._log_step_info(episode, episode_length, reward, info, 
-                                  action_counts, temperature)
-            
-            state = next_state
-            episode_reward += np.mean(reward)
-            episode_length += 1
-            episode_time += np.sum(info.get('cpu_time', 0))
-            
-            if done or truncated:
-                if episode % self.config.eval_freq == 0:
-                    self._evaluate(episode)
-                if episode % self.config.save_freq == 0:
-                    self.save_model(global_step)
-                break
-        
-        if self.config.track:
-            self._log_episode_metrics(
-                episode_reward, episode_length, episode_metrics,
-                action_counts, global_step + episode_length,
-                start_time, temperature
-            )
-        
-        return {
-            'reward': episode_reward,
-            'length': episode_length,
-            'metrics': episode_metrics,
-            'time': episode_time
-        }
+        return True
 
-
-    def _select_action_with_temperature(self, state: np.ndarray, 
-                                      temperature: float) -> Tuple:
-        """Select action using temperature-based exploration"""
-        with torch.no_grad():
-            state_tensor = torch.as_tensor(state, device=self.device)
-            
-            # Get logits and scale by temperature
-            shared_features = self.agent.shared(state_tensor)
-            action_logits = self.agent.policy_head(shared_features)
-            scaled_logits = action_logits / temperature
-            
-            # Get probabilities and sample
-            probs = torch.nn.functional.softmax(scaled_logits, dim=-1)
-            dist = torch.distributions.Categorical(probs)
-            
-            action = dist.sample()
-            log_prob = dist.log_prob(action)
-            value = self.agent.value_head(shared_features)
-            
-            return (
-                action.cpu().numpy(),
-                log_prob.cpu().numpy(),
-                value.cpu().numpy().squeeze()
-            )
-            
-    def _process_batch(self, transitions: List[Dict]) -> Dict:
-        """Process batch of transitions"""
-        for t in transitions:
-            self.agent.store_transition(
-                t['state'], t['action'], t['log_prob'],
-                t['value'], t['reward'], t['done']
-            )
+    def _evaluate(self):
+        """Run evaluation and log results"""
+        eval_rewards = []
         
-        metrics = self.agent.update()
-        return metrics
-    
-    def train(self):
-        """Main training loop"""
-        start_time = time.time()
-        global_step = 0
-        episode = 0
-        self.episode_cumulative_rewards = []
-        self.episode_total_times = []
-        
-        while global_step < self.config.total_timesteps:
-            # Calculate temperature for PPO exploration
-            temperature = 1
-            if isinstance(self.agent, PPOAgent):
-                temperature = self._get_temperature(global_step)
-            
-            # Run episode
-            episode_metrics = self._run_episode(episode, global_step, start_time, temperature)
-            global_step += episode_metrics['length']
-            episode += 1
-            
-            self.episode_cumulative_rewards.append(episode_metrics['reward'])
-            self.episode_total_times.append(episode_metrics['time'])
-            
-            if self.config.track:
-                wandb.log({
-                    "episode/reward": episode_metrics['reward'],
-                    "episode/length": episode_metrics['length'],
-                    "episode/time": episode_metrics['time']
-                })
-            
-            if episode % 10 == 0:
-                self.plot_episode_metrics()
-        
-        self.save_model(global_step, final=True)
-        if self.config.track:
-            wandb.finish()
-        
-        return self.agent
-
-    def _evaluate(self, episode: int):
-        """Evaluate current policy"""
-        print(f"Evaluating policy at episode {episode}")
-        save_dir = os.path.join(self.config.save_dir, f"episode_{episode}")
-        os.makedirs(save_dir, exist_ok=True)
-        
-        state, _ = self.env.reset()
-        total_reward = 0
-        actions_log = []
-        episode_rewards_per_point = []
-        total_episode_rewards = []
-        eval_results = []
-        eval_times = []
-        
-        with torch.no_grad():
+        for _ in range(1):
+            obs = self.eval_env.reset()
             done = False
-            step = 0
+            episode_reward = 0
+            all_eval_rewards = []
+            episode_actions = []
+            count = 0
+            
             while not done:
-                # Select action based on algorithm
-                if isinstance(self.agent, PPOAgent):
-                    action, _, _ = self.agent.select_action(state, deterministic=True)
-                else:  # SAC
-                    action = self.agent.select_action(state, deterministic=True)
-                
-                cvode_count, rk4_count = get_action_distribution(action)
-                actions_log.append(action)
-                
-                next_state, reward, done, truncated, info = self.env.step(action)
-                episode_rewards_per_point.append(reward)
-                total_episode_rewards.append(np.mean(reward))
-    
-                if step % 100 == 0:
-                    print(f"Step {step} - CVODE: {cvode_count}, RK4: {rk4_count} - "
-                          f"Reward: {np.mean(reward):.2f}")
-                
-                total_reward += np.mean(reward)
-                eval_times.append(np.sum(info.get('cpu_time', 0)))
-                state = next_state
-                step += 1
-        
-        # Save evaluation results
-        if hasattr(self.env, 'render'):
-            self.env.render(save_path=os.path.join(save_dir, f"episode_{episode}.png"))
+                action, _ = self.model.predict(obs, deterministic=True)
+                if count % 1000 == 0:
+                    print(f"Action at step {count}: {action}")
+                obs, reward, done, info = self.eval_env.step(action)
+                all_eval_rewards.append(reward)
+                episode_reward += np.mean(reward)
+                episode_actions.append(action)
+                count += 1
+                done = np.any(done)
 
-        self._plot_rewards(episode_rewards_per_point, episode, save_dir)
-
-        fig, ax = plt.subplots()
-        total_episode_rewards = np.array(total_episode_rewards)
-        ax.plot(total_episode_rewards[0:-2])
-        ax.set_title('Total Episode Rewards')
-        ax.set_xlabel('Episode')
-        ax.set_ylabel('Reward')
-        plt.savefig(os.path.join(save_dir, f"total_episode_rewards_{episode}.png"))
-        plt.close()
+            self.eval_env.env.render(
+                save_path=os.path.join(self.log_dir, f"plots/eval_step_{self.n_steps}.png")
+            )
+            eval_rewards.append(episode_reward)
         
-        self._plot_actions(actions_log, episode, save_dir)
-        print(f"Evaluation results: Total reward: {total_reward:.2f}")
-        if self.config.track:
-            wandb.log({
-                "eval/mean_reward": np.mean(total_reward),
-                "eval/episode": episode,
-                "eval/mean_time": np.mean(eval_times)
-            })
-            wandb.save(os.path.join(save_dir, f"episode_{episode}.png"))
-            wandb.save(os.path.join(save_dir, f"actions_{episode}.png"))
-            wandb.save(os.path.join(save_dir, f"rewards_{episode}.png"))
-            wandb.save(os.path.join(save_dir, f"total_episode_rewards_{episode}.png"))
-        return np.mean(total_episode_rewards)
-    
+        mean_reward = np.mean(eval_rewards)
+        std_reward = np.std(eval_rewards)
+        
+        self.logger.record("eval/mean_reward", mean_reward)
+        self.logger.record("eval/std_reward", std_reward)
+        print(f"Mean reward: {mean_reward}, Std reward: {std_reward}")
+        
+        # Plot evaluation results
+        self._plot_actions(episode_actions, self.n_steps, self.plot_dir)
+        self._plot_rewards(all_eval_rewards, self.n_steps, self.plot_dir)
+        
+        if mean_reward > self.best_mean_reward:
+            self.best_mean_reward = mean_reward
+            best_model_path = os.path.join(self.log_dir, "best_model")
+            self.model.save(best_model_path)
+            # Save the current evaluation plots with the best model
+            shutil.copy(
+                os.path.join(self.plot_dir, f"actions_{self.n_steps}.png"),
+                os.path.join(self.plot_dir, "best_model_actions.png")
+            )
+            shutil.copy(
+                os.path.join(self.plot_dir, f"rewards_{self.n_steps}.png"),
+                os.path.join(self.plot_dir, "best_model_rewards.png")
+            )
+
     def _plot_actions(self, actions, episode, save_dir):
         """Plot actions distribution over time"""
-        times_to_plot = [10, 100, 1000, 2000, 3000, 4000, 5000, 5900]
+        steps_per_space = len(actions) // 8
+        times_to_plot = [i * steps_per_space for i in range(8)]
         fig, axs = plt.subplots(len(times_to_plot)//2, 2, figsize=(12, 8))
         
         for i, time in enumerate(times_to_plot):
@@ -348,8 +108,9 @@ class EfficientTrainer:
         plt.close()
         
     def _plot_rewards(self, rewards, episode, save_dir):
-        """Plot actions distribution over time"""
-        times_to_plot = [10, 100, 1000, 2000, 3000, 4000, 5000, 5900]
+        """Plot rewards distribution over time"""
+        steps_per_space = len(rewards) // 8
+        times_to_plot = [i * steps_per_space for i in range(8)]
         fig, axs = plt.subplots(len(times_to_plot)//2, 2, figsize=(12, 8))
         
         for i, time in enumerate(times_to_plot):
@@ -362,174 +123,233 @@ class EfficientTrainer:
         plt.tight_layout()
         plt.savefig(os.path.join(save_dir, f"rewards_{episode}.png"))
         plt.close()
-    
-    def save_model(self, step: int, final: bool = False):
-        """Save model checkpoint"""
-        save_dir = os.path.join(self.config.save_dir, "models")
-        os.makedirs(save_dir, exist_ok=True)
-        
-        model_path = os.path.join(
-            save_dir,
-            "model_final.pt" if final else f"model_{step}.pt"
-        )
-        
-        self.agent.save(model_path)
-        
-        if self.config.track:
-            wandb.save(model_path)
-            
-    def _log_step_info(self, episode: int, step: int, reward: float,
-                      info: Dict, action_counts: Dict, temperature: float):
-        """Log step information"""
-        print(
-            f"Episode {episode} - Step: {step} - "
-            f"Reward: {np.mean(reward):.2f} - "
-            f"Time: {np.sum(info.get('cpu_time', 0)):.4f} - "
-            f"Actions: CVODE: {action_counts['CVODE']}, RK4: {action_counts['RK4']} - "
-            f"Temp: {temperature:.3f} - "
-            f"Memory: {get_memory_usage():.2f} MB"
-        )
-    
-    def _log_episode_metrics(self, episode_reward: float, episode_length: int,
-                           metrics: Dict, action_counts: Dict, global_step: int,
-                           start_time: float, temperature: float):
-        """Log episode metrics to wandb"""
-        total_actions = action_counts['CVODE'] + action_counts['RK4']
-        cvode_ratio = action_counts['CVODE'] / total_actions if total_actions > 0 else 0
-        
-        wandb.log({
-            "episode/reward": episode_reward,
-            "episode/length": episode_length,
-            "episode/value_loss": metrics.get('value_loss', 0),
-            "episode/policy_loss": metrics.get('policy_loss', 0),
-            "episode/entropy": metrics.get('entropy', 0),
-            "episode/temperature": temperature,
-            "episode/cvode_ratio": cvode_ratio,
-            "episode/sps": int(global_step / (time.time() - start_time)),
-            "global_step": global_step,
-        })
 
-
-def plot_actions(actions, step, dir):
-    """Plot actions"""
-    times_to_plot = [10, 100, 1000, 2000, 3000, 4000, 5000, 5900]
-    fig, axs = plt.subplots(len(times_to_plot)//2, 2, figsize=(12, 8))
-    for i, time in enumerate(times_to_plot):
-        axs[i//2, i%2].plot(actions[time])
-        axs[i//2, i%2].set_title(f"Time: {time}")
-    plt.tight_layout()
-    plt.savefig(f'{dir}/actions_{step}.png')
-    plt.close()
-            
-if __name__ == "__main__":
-    # Parse arguments
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--algorithm", type=str, choices=["PPO", "SAC"], default="PPO")
-    args = parser.parse_args()
-
-    # Common trainer config
-    trainer_config = TrainerConfig(
-        algorithm=args.algorithm,
-        exp_name=f"combustion_{args.algorithm.lower()}_1d",
-        cuda=True,
-        track=True,
-        total_timesteps=1000000,
-        batch_size=600,
-        n_points=50,
-        T_fuel=600,
-        T_oxidizer=1200,
-        pressure=101325,
-        global_timestep=1e-5,
-        profile_interval=100,
-        t_end=0.06
+def setup_environment(config: TrainingConfig):
+    """Setup training environment based on configuration"""
+    # Create simulation settings
+    sim_settings = SimulationSettings(
+        output_dir=config.output_dir,
+        n_threads=config.n_threads,
+        n_points=config.n_points,
+        global_timestep=config.global_timestep,
+        profile_interval=config.profile_interval,
+        equilibrate_counterflow=False,
+        center_width=0.002,
+        slope_width=0.001
     )
+    
+    # Create environment
+    env = create_randomized_env(
+        base_settings=sim_settings,
+        sim_configs=config.sim_configs,
+        species_to_track=config.species_to_track,
+        features_config=config.features.__dict__,
+        reward_config=config.reward.__dict__
+    )
+    
+    return env
 
-    # Environment configurations
-    features_config = {
-        'local_features': True,
-        'neighbor_features': False,
-        'gradient_features': True,
-        'temporal_features': False,
-        'window_size': 4
-    }
+def train_combustion_rl(config: TrainingConfig, env=None):
+    """Main training function using configuration"""
+    # Initialize wandb if enabled
+    if config.use_wandb:
+        wandb.init(
+            project=config.wandb_project,
+            entity=config.wandb_entity,
+            name=config.exp_name,
+            config=config.__dict__
+        )
+    
+    # Create log directory
+    log_dir = os.path.join(
+        'logs',
+        f"{config.exp_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Save configuration
+    config_path = os.path.join(log_dir, "config.yaml")
+    config.save(config_path)
+    print(f"Configuration saved to {config_path}")
+    
+    # Configure logger
+    new_logger = configure(log_dir, ["stdout", "csv", "tensorboard"])
+    
+    # Create environment if not provided
+    if env is None:
+        env = setup_environment(config)
+    
+    # Configure model
+    model = PPO(
+        "MlpPolicy",
+        env,
+        verbose=1,
+        tensorboard_log=log_dir,
+        **config.get_ppo_kwargs(),
 
-    reward_config = {
-        'weights': {
+    )
+    
+    # Set the new logger
+    model.set_logger(new_logger)
+    
+    # Calculate evaluation frequency based on environment steps
+    eval_freq = env.num_envs * config.eval_freq
+    
+    # Setup callbacks
+    callbacks = [
+        CombustionCallback(
+            eval_env=env,
+            log_dir=log_dir,
+            eval_freq=eval_freq
+        ),
+        CheckpointCallback(
+            save_freq=config.save_freq,
+            save_path=os.path.join(log_dir, "checkpoints"),
+            name_prefix="combustion_model"
+        )
+    ]
+    
+    try:
+        # Train model
+        model.learn(
+            total_timesteps=config.ppo.total_timesteps,
+            callback=callbacks,
+            progress_bar=True,
+            log_interval=config.log_interval,
+            tb_log_name=config.exp_name
+        )
+        
+        # Save final model
+        final_model_path = os.path.join(log_dir, "final_model")
+        model.save(final_model_path)
+        print(f"Final model saved to {final_model_path}")
+        
+    except Exception as e:
+        print(f"Training failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    finally:
+        if config.use_wandb:
+            wandb.finish()
+        
+        # Clean up environment
+        if env:
+            env.close()
+    
+    return model, log_dir
+
+def load_and_test_model(model_path: str, config_path: str, n_episodes: int = 5):
+    """Load and test a trained model"""
+    # Load configuration
+    config = TrainingConfig.load(config_path)
+    
+    # Setup environment
+    env = setup_environment(config)
+    
+    # Load model
+    model = PPO.load(model_path, env=env)
+    
+    results = []
+    for episode in range(n_episodes):
+        obs = env.reset()
+        done = False
+        total_reward = 0
+        steps = 0
+        
+        while not done:
+            action, _ = model.predict(obs, deterministic=True)
+            obs, reward, done, info = env.step(action)
+            total_reward += np.mean(reward)
+            steps += 1
+            done = np.any(done)
+        
+        results.append({
+            'episode': episode,
+            'total_reward': total_reward,
+            'steps': steps
+        })
+        print(f"Episode {episode}: Total Reward = {total_reward:.2f}, Steps = {steps}")
+    
+    return results
+
+if __name__ == "__main__":
+    # Create default configuration
+    config = create_default_config()
+    
+    # Modify configuration to match original settings
+    config.exp_name = "combustion_control"
+    config.output_dir = f"experiments/{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    config.use_wandb = False
+    config.wandb_project = "combustion_rl"
+    
+    # Environment settings
+    config.n_points = 50
+    config.n_threads = 2
+    config.global_timestep = 1e-5
+    config.profile_interval = 100
+    
+    # PPO settings
+    config.ppo = PPOConfig(
+        learning_rate=1e-3,
+        n_steps=1000,
+        batch_size=50_000,
+        n_epochs=8,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        clip_range_vf=None,
+        ent_coef=0.05,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        total_timesteps=50_000_000
+    )
+    
+    # Network settings
+    config.network = NetworkConfig(
+        pi_layers=[256, 128, 64],
+        vf_layers=[256, 128, 64],
+        activation_fn="ReLU"
+    )
+    
+    # Feature settings
+    config.features = FeatureConfig(
+        local_features=True,
+        neighbor_features=False,
+        gradient_features=True,
+        temporal_features=False,
+        window_size=5
+    )
+    
+    # Reward settings
+    config.reward = RewardConfig(
+        weights={
             'accuracy': 1,
             'efficiency': 3,
         },
-        'thresholds': {
+        thresholds={
             'time': 0.001,
             'error': 1
         },
-        'scaling': {
+        scaling={
             'time': 1,
             'error': 1
         },
-        'use_neighbors': True,
-        'neighbor_weight': 0.3,
-        'neighbor_radius': 4
-    }
-
-    # Create environment
-    env = create_env(
-        sim_settings=SimulationSettings(
-            n_threads=2,
-            output_dir=trainer_config.output_dir,
-            t_end=trainer_config.t_end,
-            n_points=trainer_config.n_points,
-            T_fuel=trainer_config.T_fuel,
-            T_oxidizer=trainer_config.T_oxidizer,
-            pressure=trainer_config.pressure,
-            global_timestep=trainer_config.global_timestep,
-            profile_interval=trainer_config.profile_interval
-        ),
-        benchmark_file='env_benchmark2.h5',
-        features_config=features_config,
-        reward_config=reward_config,
-        save_step_data=False
+        use_neighbors=True,
+        neighbor_weight=0.3,
+        neighbor_radius=4
     )
-
-    # Create agent based on selected algorithm
-    if args.algorithm == "PPO":
-        ppo_config = PPOConfig(
-            lr=1e-4,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_ratio=0.3,
-            target_kl=0.03,
-            n_epochs=10,
-            batch_size=512,
-            value_coef=0.5,
-            entropy_coef=0.1,
-            buffer_size=10000
-        )
-        agent = PPOAgent(
-            obs_dim=env.observation_space.shape[1],
-            n_actions=len(env.integrator_options),
-            hidden_dims=[512, 256, 256, 128],
-            config=ppo_config,
-            device="cuda" if trainer_config.cuda and torch.cuda.is_available() else "cpu"
-        )
-    else:  # SAC
-        sac_config = SACConfig(
-            lr=3e-4,
-            alpha_lr=3e-4,
-            gamma=0.99,
-            tau=0.01,
-            buffer_size=1000000,
-            batch_size=256,
-            init_temperature=2.0,  # Start with more exploration
-            min_temperature=0.1,   # Minimum temperature for stability
-            hidden_dims=[512, 256, 256, 128]
-        )
-        agent = DiscreteSAC(
-            obs_dim=env.observation_space.shape[1],
-            n_actions=len(env.integrator_options),
-            config=sac_config,
-            device="cuda" if trainer_config.cuda and torch.cuda.is_available() else "cpu"
-        )
-
-    # Create trainer and train
-    trainer = EfficientTrainer(env, agent, trainer_config)
-    trained_agent = trainer.train()
+    
+    # Species to track
+    config.species_to_track = ['CH4', 'CO2', 'HO2', 'H2O2', 'OH', 'O2', 'H2', 'H2O']
+    
+    print(f"Starting training with {config.ppo.total_timesteps} timesteps...")
+    model, log_dir = train_combustion_rl(config)
+    
+    print("\nTraining complete. Testing model...")
+    test_results = load_and_test_model(
+        model_path=os.path.join(log_dir, "final_model"),
+        config_path=os.path.join(log_dir, "config.yaml"),
+        n_episodes=3
+    )
+    print("\nTest results:", test_results)
